@@ -241,7 +241,9 @@ class CppAsmConverter:
                     converted = self.convert_asm_block(asm_lines, indent)
                 self.output_lines.append(converted)
             else:
-                self.output_lines.append(line)
+                # Check for printf(register) pattern and convert it
+                converted_line = self.convert_printf_register(line)
+                self.output_lines.append(converted_line)
                 i += 1
         
         # Add architecture metadata comment at the top
@@ -321,6 +323,87 @@ class CppAsmConverter:
         """Extract leading whitespace from a line."""
         match = re.match(r'^(\s*)', line)
         return match.group(1) if match else ''
+
+    def convert_printf_register(self, line):
+        """
+        Convert printf(register) to proper printf with format string.
+        
+        Supports:
+        - printf(rax)  -> prints 64-bit integer
+        - printf(eax)  -> prints 32-bit integer  
+        - printf(al)   -> prints 8-bit as char
+        - printf(x0)   -> prints ARM64 register
+        """
+        stripped = line.strip()
+        indent = self.get_indent(line)
+        
+        # Match printf(register) pattern - with or without semicolon
+        match = re.match(r'^printf\s*\(\s*([a-zA-Z][a-zA-Z0-9]*)\s*\)\s*;?\s*$', stripped)
+        if not match:
+            return line
+        
+        reg = match.group(1).lower()
+        
+        # Check if it's an x86 register
+        if reg in self.x86_registers:
+            size = self.x86_registers[reg]
+            self.detected_archs.add('x86_64')
+            
+            if size == 'b':
+                # 8-bit register - print as character
+                return f'''{indent}{{
+{indent}    unsigned char __reg_val__;
+{indent}    __asm__ volatile("movb %%{reg}, %0" : "=r" (__reg_val__));
+{indent}    printf("%c", __reg_val__);
+{indent}}}'''
+            elif size == 'w':
+                # 16-bit register
+                return f'''{indent}{{
+{indent}    unsigned short __reg_val__;
+{indent}    __asm__ volatile("movw %%{reg}, %0" : "=r" (__reg_val__));
+{indent}    printf("%d", __reg_val__);
+{indent}}}'''
+            elif size == 'l':
+                # 32-bit register
+                return f'''{indent}{{
+{indent}    unsigned int __reg_val__;
+{indent}    __asm__ volatile("movl %%e{reg[-2:]}, %0" : "=r" (__reg_val__) : : );
+{indent}    printf("%d", __reg_val__);
+{indent}}}'''
+            elif size == 'q':
+                # 64-bit register
+                return f'''{indent}{{
+{indent}    unsigned long long __reg_val__;
+{indent}    __asm__ volatile("movq %%{reg}, %0" : "=r" (__reg_val__));
+{indent}    printf("%lld", __reg_val__);
+{indent}}}'''
+            else:
+                # SIMD registers - print as hex
+                return f'{indent}printf("(SIMD register {reg})");'
+        
+        # Check if it's an ARM64 register
+        elif reg in self.arm64_registers:
+            self.detected_archs.add('arm64')
+            
+            if reg.startswith('x') or reg == 'sp':
+                # 64-bit ARM register
+                return f'''{indent}{{
+{indent}    unsigned long long __reg_val__;
+{indent}    __asm__ volatile("mov %0, {reg}" : "=r" (__reg_val__));
+{indent}    printf("%lld", __reg_val__);
+{indent}}}'''
+            elif reg.startswith('w'):
+                # 32-bit ARM register
+                return f'''{indent}{{
+{indent}    unsigned int __reg_val__;
+{indent}    __asm__ volatile("mov %w0, {reg}" : "=r" (__reg_val__));
+{indent}    printf("%d", __reg_val__);
+{indent}}}'''
+            else:
+                return f'{indent}printf("(ARM register {reg})");'
+        
+        # Not a register, return line unchanged
+        return line
 
     def convert_asm_block(self, lines, indent):
         """

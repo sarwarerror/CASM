@@ -84,8 +84,16 @@ class Builder:
         except Exception:
             pass
         
-        # Use detected architecture if available, otherwise use provided
-        compile_arch = detected_arch or self.arch
+        # Determine compile architecture
+        # For Windows: always use x86_64 (MinGW) unless ARM64 assembly is explicitly detected
+        # This allows pure C code AND x86_64 assembly to work with MinGW
+        if self.target == 'windows':
+            if detected_arch == 'arm64':
+                compile_arch = 'arm64'  # Only if explicitly ARM64 assembly
+            else:
+                compile_arch = 'x86_64'  # Default Windows to x86_64 (MinGW)
+        else:
+            compile_arch = detected_arch or self.arch
         
         with CLI.spinner(f"Compiling {os.path.basename(exe_file)}..."):
             self.log(f"Compiling {self.compiled_file} with GCC/Clang...")
@@ -111,14 +119,10 @@ class Builder:
                     if cross_gcc:
                         cmd = [cross_gcc, self.compiled_file, '-o', exe_file, '-m64']
                     else:
-                        # Fallback to host gcc
-                        host_gcc = shutil.which('gcc') or shutil.which('clang')
-                        if host_gcc:
-                            CLI.warning("mingw-w64 cross-compiler not found. Trying host compiler (may fail).")
-                            cmd = [host_gcc, self.compiled_file, '-o', exe_file, '-m64']
-                        else:
-                            CLI.error("No suitable C compiler found for Windows.")
-                            return False
+                        # No cross-compiler available
+                        CLI.error("mingw-w64 cross-compiler not found.")
+                        CLI.info("Install with: brew install mingw-w64")
+                        return False
                             
             elif self.target == 'linux':
                 compiler = shutil.which('gcc') or shutil.which('clang')
@@ -202,8 +206,16 @@ class Builder:
         except Exception:
             pass
         
-        # Use detected architecture if available, otherwise use provided
-        compile_arch = detected_arch or self.arch
+        # Determine compile architecture
+        # For Windows: always use x86_64 (MinGW) unless ARM64 assembly is explicitly detected
+        # This allows pure C++ code AND x86_64 assembly to work with MinGW
+        if self.target == 'windows':
+            if detected_arch == 'arm64':
+                compile_arch = 'arm64'  # Only if explicitly ARM64 assembly
+            else:
+                compile_arch = 'x86_64'  # Default Windows to x86_64 (MinGW)
+        else:
+            compile_arch = detected_arch or self.arch
         
         with CLI.spinner(f"Compiling {os.path.basename(exe_file)}..."):
             self.log(f"Compiling {self.compiled_file} with C++ compiler...")
@@ -229,14 +241,10 @@ class Builder:
                     if cross_gpp:
                         cmd = [cross_gpp, self.compiled_file, '-o', exe_file, '-m64']
                     else:
-                        # Fallback to host g++
-                        host_gpp = shutil.which('g++') or shutil.which('clang++')
-                        if host_gpp:
-                            CLI.warning("mingw-w64 cross-compiler not found. Trying host compiler (may fail).")
-                            cmd = [host_gpp, self.compiled_file, '-o', exe_file, '-m64']
-                        else:
-                            CLI.error("No suitable C++ compiler found for Windows.")
-                            return False
+                        # No cross-compiler available
+                        CLI.error("mingw-w64 cross-compiler not found.")
+                        CLI.info("Install with: brew install mingw-w64")
+                        return False
                             
             elif self.target == 'linux':
                 compiler = shutil.which('g++') or shutil.which('clang++')
