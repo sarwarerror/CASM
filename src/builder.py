@@ -25,6 +25,10 @@ class Builder:
         # Check if the input is a C file (from the new C-to-ASM feature)
         if self.compiled_file.lower().endswith('.c'):
             return self.compile_c_file()
+        
+        # Check if the input is a C++ file (from the new CPP inline asm feature)
+        if self.compiled_file.lower().endswith('.cpp'):
+            return self.compile_cpp_file()
 
         obj_ext = '.obj' if self.target == 'windows' else '.o'
         exe_ext = '.exe' if self.target == 'windows' else ''
@@ -52,6 +56,7 @@ class Builder:
         return True
 
     def compile_c_file(self):
+        """Compile C files with inline assembly support for any architecture/platform."""
         exe_ext = '.exe' if self.target == 'windows' else ''
         
         # Determine output executable name
@@ -62,33 +67,84 @@ class Builder:
             
         exe_file = base_no_gen + exe_ext
         
+        # Read architecture metadata from generated file
+        detected_arch = None
+        try:
+            with open(self.compiled_file, 'r') as f:
+                first_line = f.readline()
+                if first_line.startswith('// CASM_ARCH:'):
+                    arch_str = first_line.split(':', 1)[1].strip()
+                    # If only one architecture detected, use it
+                    if ',' not in arch_str and arch_str != 'none':
+                        detected_arch = arch_str
+                    elif 'x86_64' in arch_str:
+                        # If both detected but x86_64 is present, prefer x86_64
+                        # (x86 inline asm can't run on ARM64)
+                        detected_arch = 'x86_64'
+        except Exception:
+            pass
+        
+        # Use detected architecture if available, otherwise use provided
+        compile_arch = detected_arch or self.arch
+        
         with CLI.spinner(f"Compiling {os.path.basename(exe_file)}..."):
             self.log(f"Compiling {self.compiled_file} with GCC/Clang...")
+            if detected_arch and detected_arch != self.arch:
+                self.log(f"Using detected architecture: {detected_arch}")
             
-            # Determine compiler command
+            # Determine compiler command based on target and architecture
             cmd = []
+            
             if self.target == 'windows':
-                 # Prefer mingw-w64 cross-compiler if available
-                cross_gcc = shutil.which('x86_64-w64-mingw32-gcc') or shutil.which('x86_64-w64-mingw32-clang')
-                if cross_gcc:
-                    cmd = [cross_gcc, self.compiled_file, '-o', exe_file, '-m64']
-                else:
-                    host_gcc = shutil.which('gcc')
-                    if host_gcc:
-                        CLI.warning("mingw-w64 cross-compiler not found. Trying host gcc (may fail).")
-                        cmd = [host_gcc, self.compiled_file, '-o', exe_file, '-m64']
+                if compile_arch == 'arm64':
+                    # ARM64 Windows - use clang with MSVC target
+                    compiler = shutil.which('clang')
+                    if compiler:
+                        cmd = [compiler, self.compiled_file, '-o', exe_file,
+                               '--target=aarch64-pc-windows-msvc', '-fuse-ld=lld']
                     else:
-                        CLI.error("No suitable GCC found to compile Windows executable.")
+                        CLI.error("clang not found for ARM64 Windows compilation.")
                         return False
-            else:
-                # Linux/macOS
+                else:
+                    # x86_64 Windows - prefer mingw-w64 cross-compiler
+                    cross_gcc = shutil.which('x86_64-w64-mingw32-gcc') or shutil.which('x86_64-w64-mingw32-clang')
+                    if cross_gcc:
+                        cmd = [cross_gcc, self.compiled_file, '-o', exe_file, '-m64']
+                    else:
+                        # Fallback to host gcc
+                        host_gcc = shutil.which('gcc') or shutil.which('clang')
+                        if host_gcc:
+                            CLI.warning("mingw-w64 cross-compiler not found. Trying host compiler (may fail).")
+                            cmd = [host_gcc, self.compiled_file, '-o', exe_file, '-m64']
+                        else:
+                            CLI.error("No suitable C compiler found for Windows.")
+                            return False
+                            
+            elif self.target == 'linux':
                 compiler = shutil.which('gcc') or shutil.which('clang')
                 if not compiler:
-                    CLI.error("GCC or Clang not found.")
+                    CLI.error("gcc or clang not found.")
                     return False
                 cmd = [compiler, self.compiled_file, '-o', exe_file]
-                if self.target == 'linux':
+                if compile_arch == 'x86_64':
                     cmd.append('-m64')
+                elif compile_arch == 'arm64':
+                    # Cross-compile for ARM64 if needed
+                    cross_gcc = shutil.which('aarch64-linux-gnu-gcc')
+                    if cross_gcc:
+                        cmd = [cross_gcc, self.compiled_file, '-o', exe_file]
+                    # else use native compiler
+                    
+            elif self.target == 'macos':
+                compiler = shutil.which('clang') or shutil.which('gcc')
+                if not compiler:
+                    CLI.error("clang or gcc not found.")
+                    return False
+                cmd = [compiler, self.compiled_file, '-o', exe_file, '-arch', compile_arch]
+                
+            else:
+                CLI.error(f"Unsupported target: {self.target}")
+                return False
 
             # Add debug flags
             if self.debug:
@@ -112,6 +168,127 @@ class Builder:
                     return False
             except Exception as e:
                 CLI.error(f"Compilation error: {e}")
+                return False
+                
+        CLI.success(f"Built {os.path.basename(exe_file)}")
+        return True
+
+    def compile_cpp_file(self):
+        """Compile C++ files with inline assembly support for any architecture/platform."""
+        exe_ext = '.exe' if self.target == 'windows' else ''
+        
+        # Determine output executable name
+        if self.compiled_file.endswith('-gen.cpp'):
+            base_no_gen = self.compiled_file[:-len('-gen.cpp')]
+        else:
+            base_no_gen = os.path.splitext(self.compiled_file)[0]
+            
+        exe_file = base_no_gen + exe_ext
+        
+        # Read architecture metadata from generated file
+        detected_arch = None
+        try:
+            with open(self.compiled_file, 'r') as f:
+                first_line = f.readline()
+                if first_line.startswith('// CASM_ARCH:'):
+                    arch_str = first_line.split(':', 1)[1].strip()
+                    # If only one architecture detected, use it
+                    if ',' not in arch_str and arch_str != 'none':
+                        detected_arch = arch_str
+                    elif 'x86_64' in arch_str:
+                        # If both detected but x86_64 is present, prefer x86_64
+                        # (x86 inline asm can't run on ARM64)
+                        detected_arch = 'x86_64'
+        except Exception:
+            pass
+        
+        # Use detected architecture if available, otherwise use provided
+        compile_arch = detected_arch or self.arch
+        
+        with CLI.spinner(f"Compiling {os.path.basename(exe_file)}..."):
+            self.log(f"Compiling {self.compiled_file} with C++ compiler...")
+            if detected_arch and detected_arch != self.arch:
+                self.log(f"Using detected architecture: {detected_arch}")
+            
+            # Determine compiler command based on target and architecture
+            cmd = []
+            
+            if self.target == 'windows':
+                if compile_arch == 'arm64':
+                    # ARM64 Windows - use clang++ with MSVC target
+                    compiler = shutil.which('clang++')
+                    if compiler:
+                        cmd = [compiler, self.compiled_file, '-o', exe_file,
+                               '--target=aarch64-pc-windows-msvc', '-fuse-ld=lld']
+                    else:
+                        CLI.error("clang++ not found for ARM64 Windows compilation.")
+                        return False
+                else:
+                    # x86_64 Windows - prefer mingw-w64 cross-compiler
+                    cross_gpp = shutil.which('x86_64-w64-mingw32-g++') or shutil.which('x86_64-w64-mingw32-clang++')
+                    if cross_gpp:
+                        cmd = [cross_gpp, self.compiled_file, '-o', exe_file, '-m64']
+                    else:
+                        # Fallback to host g++
+                        host_gpp = shutil.which('g++') or shutil.which('clang++')
+                        if host_gpp:
+                            CLI.warning("mingw-w64 cross-compiler not found. Trying host compiler (may fail).")
+                            cmd = [host_gpp, self.compiled_file, '-o', exe_file, '-m64']
+                        else:
+                            CLI.error("No suitable C++ compiler found for Windows.")
+                            return False
+                            
+            elif self.target == 'linux':
+                compiler = shutil.which('g++') or shutil.which('clang++')
+                if not compiler:
+                    CLI.error("g++ or clang++ not found.")
+                    return False
+                cmd = [compiler, self.compiled_file, '-o', exe_file]
+                if compile_arch == 'x86_64':
+                    cmd.append('-m64')
+                elif compile_arch == 'arm64':
+                    # Cross-compile for ARM64 if needed
+                    cross_gpp = shutil.which('aarch64-linux-gnu-g++')
+                    if cross_gpp:
+                        cmd = [cross_gpp, self.compiled_file, '-o', exe_file]
+                    # else use native compiler
+                    
+            elif self.target == 'macos':
+                compiler = shutil.which('clang++') or shutil.which('g++')
+                if not compiler:
+                    CLI.error("clang++ or g++ not found.")
+                    return False
+                cmd = [compiler, self.compiled_file, '-o', exe_file, '-arch', compile_arch]
+                
+            else:
+                CLI.error(f"Unsupported target: {self.target}")
+                return False
+
+            # Add debug flags
+            if self.debug:
+                cmd.append('-g')
+            
+            # Add C++ standard (C++17 for good inline asm support)
+            cmd.extend(['-std=c++17'])
+                
+            # Add user linker flags
+            if self.linker_flags:
+                try:
+                    extra = shlex.split(self.linker_flags)
+                except Exception:
+                    extra = self.linker_flags.split()
+                cmd.extend(extra)
+            
+            self.log(f"Running: {' '.join(cmd)}")
+            
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True)
+                if result.returncode != 0:
+                    CLI.error("C++ compilation failed:")
+                    print(result.stderr)
+                    return False
+            except Exception as e:
+                CLI.error(f"C++ compilation error: {e}")
                 return False
                 
         CLI.success(f"Built {os.path.basename(exe_file)}")
@@ -275,6 +452,8 @@ class Builder:
             base_no_gen = self.compiled_file[:-len('-gen.asm')]
         elif self.compiled_file.endswith('-gen.c'):
             base_no_gen = self.compiled_file[:-len('-gen.c')]
+        elif self.compiled_file.endswith('-gen.cpp'):
+            base_no_gen = self.compiled_file[:-len('-gen.cpp')]
         else:
             base_no_gen = os.path.splitext(self.compiled_file)[0]
 

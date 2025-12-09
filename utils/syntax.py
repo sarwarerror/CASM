@@ -5,6 +5,7 @@ from src.token import TokenType
 from .formatter import format_and_merge
 from .cli import CLI
 from src.c_asm_converter import CAsmConverter
+from src.cpp_asm_converter import CppAsmConverter
 import os
 import re
 import pathlib
@@ -107,6 +108,16 @@ class Compiler:
         ext = os.path.splitext(input_file)[1]
         if ext.lower() == '.c':
             default_out = os.path.join(build_dir, f"{base}-gen.c")
+            # If user provides output file, ensure it has .c extension for the generated source
+            if output_file:
+                output_base = os.path.splitext(output_file)[0]
+                output_file = output_base + '-gen.c'
+        elif ext.lower() == '.cpp':
+            default_out = os.path.join(build_dir, f"{base}-gen.cpp")
+            # If user provides output file, ensure it has .cpp extension for the generated source
+            if output_file:
+                output_base = os.path.splitext(output_file)[0]
+                output_file = output_base + '-gen.cpp'
         else:
             default_out = os.path.join(build_dir, f"{base}-gen.asm")
         self.output_file = output_file or default_out
@@ -125,7 +136,8 @@ class Compiler:
                 with open(self.input_file, 'r', encoding='utf-8') as f:
                     source = f.read()
                 
-                converter = CAsmConverter(source)
+                # Pass architecture to converter for better code generation
+                converter = CAsmConverter(source, arch=self.arch)
                 output = converter.convert()
                 
                 with open(self.output_file, 'w', encoding='utf-8') as f:
@@ -136,6 +148,27 @@ class Compiler:
                 return True
             except Exception as e:
                 CLI.error(f"C conversion error: {e}")
+                import traceback
+                traceback.print_exc()
+                return False
+        
+        if self.input_file.lower().endswith('.cpp'):
+            try:
+                with open(self.input_file, 'r', encoding='utf-8') as f:
+                    source = f.read()
+                
+                # Pass architecture to converter for better code generation
+                converter = CppAsmConverter(source, arch=self.arch)
+                output = converter.convert()
+                
+                with open(self.output_file, 'w', encoding='utf-8') as f:
+                    f.write(output)
+                
+                self.log(f"C++ conversion successful: {self.output_file}")
+                CLI.success(f"Converted {os.path.basename(self.input_file)}")
+                return True
+            except Exception as e:
+                CLI.error(f"C++ conversion error: {e}")
                 import traceback
                 traceback.print_exc()
                 return False

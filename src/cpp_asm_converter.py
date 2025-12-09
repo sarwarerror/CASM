@@ -1,36 +1,28 @@
 import re
 
 
-class CAsmConverter:
-    """
-    Converts C files with NASM-style inline assembly to GCC inline assembly.
-    
-    Supports:
-    - asm() blocks with NASM syntax
-    - Direct assembly without wrapper
-    - Variable mapping [var] syntax
-    - Push/pop tracking
-    - Local labels with loops
-    - Complex array indexing [array + i * 8]
-    - Auto-detection of x86_64 vs ARM64
-    - Memory clobber detection
-    - Function call handling with ABI support
-    """
-    
+class CppAsmConverter:
     # Class-level counter for unique asm block IDs
     _asm_block_counter = 0
-    # Class-level registry for global labels
-    _global_labels = {}
+    # Class-level registry for global labels (shared across asm blocks)
+    _global_labels = {}  # label_name -> unique_name
     
     def __init__(self, source, arch=None):
+        """
+        Initialize the converter.
+        
+        Args:
+            source: The C++ source code
+            arch: Target architecture ('x86_64', 'arm64', or None for auto-detect)
+        """
         self.source = source
         self.lines = source.split('\n')
         self.output_lines = []
         self.arch = arch  # Will be auto-detected if None
         
         # Reset global labels for each file conversion
-        CAsmConverter._global_labels = {}
-        CAsmConverter._asm_block_counter = 0
+        CppAsmConverter._global_labels = {}
+        CppAsmConverter._asm_block_counter = 0
         
         # x86 Register mapping to sizes (for suffix determination)
         self.x86_registers = {
@@ -54,24 +46,6 @@ class CAsmConverter:
             'xmm8': 'x', 'xmm9': 'x', 'xmm10': 'x', 'xmm11': 'x', 'xmm12': 'x', 'xmm13': 'x', 'xmm14': 'x', 'xmm15': 'x',
             'ymm0': 'y', 'ymm1': 'y', 'ymm2': 'y', 'ymm3': 'y', 'ymm4': 'y', 'ymm5': 'y', 'ymm6': 'y', 'ymm7': 'y',
             'ymm8': 'y', 'ymm9': 'y', 'ymm10': 'y', 'ymm11': 'y', 'ymm12': 'y', 'ymm13': 'y', 'ymm14': 'y', 'ymm15': 'y',
-        }
-        
-        # ARM64 register mapping
-        self.arm64_registers = {
-            # General purpose (64-bit)
-            'x0': '', 'x1': '', 'x2': '', 'x3': '', 'x4': '', 'x5': '', 'x6': '', 'x7': '',
-            'x8': '', 'x9': '', 'x10': '', 'x11': '', 'x12': '', 'x13': '', 'x14': '', 'x15': '',
-            'x16': '', 'x17': '', 'x18': '', 'x19': '', 'x20': '', 'x21': '', 'x22': '', 'x23': '',
-            'x24': '', 'x25': '', 'x26': '', 'x27': '', 'x28': '', 'x29': '', 'x30': '', 'sp': '', 'xzr': '',
-            # General purpose (32-bit)
-            'w0': '', 'w1': '', 'w2': '', 'w3': '', 'w4': '', 'w5': '', 'w6': '', 'w7': '',
-            'w8': '', 'w9': '', 'w10': '', 'w11': '', 'w12': '', 'w13': '', 'w14': '', 'w15': '',
-            'w16': '', 'w17': '', 'w18': '', 'w19': '', 'w20': '', 'w21': '', 'w22': '', 'w23': '',
-            'w24': '', 'w25': '', 'w26': '', 'w27': '', 'w28': '', 'w29': '', 'w30': '', 'wzr': '',
-            # SIMD/FP registers
-            'v0': '', 'v1': '', 'v2': '', 'v3': '', 'v4': '', 'v5': '', 'v6': '', 'v7': '',
-            'd0': '', 'd1': '', 'd2': '', 'd3': '', 'd4': '', 'd5': '', 'd6': '', 'd7': '',
-            's0': '', 's1': '', 's2': '', 's3': '', 's4': '', 's5': '', 's6': '', 's7': '',
         }
 
         # Instructions that write to the first operand (dest)
@@ -106,27 +80,51 @@ class CAsmConverter:
             'jo', 'jno', 'js', 'jns', 'jp', 'jnp',
             'loop', 'loope', 'loopne',
             'ret', 'leave', 'nop', 'hlt', 'syscall', 'int',
+            'div', 'mul', 'idiv', 'imul',
         }
         
-        # ARM64 mnemonics
+        # ARM64 registers
+        self.arm64_registers = set()
+        # General purpose registers x0-x30 and w0-w30
+        for i in range(31):
+            self.arm64_registers.add(f'x{i}')
+            self.arm64_registers.add(f'w{i}')
+        # Special registers
+        self.arm64_registers.update(['sp', 'xzr', 'wzr', 'lr', 'fp'])
+        # SIMD registers v0-v31 and their aliases
+        for i in range(32):
+            self.arm64_registers.add(f'v{i}')
+            self.arm64_registers.add(f'd{i}')
+            self.arm64_registers.add(f's{i}')
+            self.arm64_registers.add(f'h{i}')
+            self.arm64_registers.add(f'b{i}')
+            self.arm64_registers.add(f'q{i}')
+        
+        # ARM64 instructions that write to the first operand
         self.arm64_write_ops = {
-            'mov', 'movz', 'movn', 'movk', 'add', 'sub', 'mul', 'sdiv', 'udiv',
-            'and', 'orr', 'eor', 'lsl', 'lsr', 'asr', 'ror',
-            'ldr', 'ldp', 'ldrb', 'ldrh', 'ldrsb', 'ldrsh', 'ldrsw',
-            'adc', 'sbc', 'neg', 'mvn', 'bic', 'orn',
-            'madd', 'msub', 'smull', 'umull',
-            'csel', 'csinc', 'csinv', 'csneg', 'cset', 'csetm',
+            'mov', 'movz', 'movn', 'movk', 'ldr', 'ldp', 'ldrb', 'ldrh', 'ldrsb', 'ldrsh', 'ldrsw',
+            'add', 'sub', 'mul', 'sdiv', 'udiv', 'madd', 'msub',
+            'and', 'orr', 'eor', 'bic', 'orn', 'eon',
+            'lsl', 'lsr', 'asr', 'ror',
+            'adc', 'sbc', 'neg', 'mvn',
+            'csel', 'csinc', 'csinv', 'csneg',
+            'sxtb', 'sxth', 'sxtw', 'uxtb', 'uxth',
+            'rev', 'rev16', 'rev32', 'clz', 'cls',
             'fmov', 'fadd', 'fsub', 'fmul', 'fdiv', 'fneg', 'fabs', 'fsqrt',
+            'fcvt', 'scvtf', 'ucvtf', 'fcvtzs', 'fcvtzu',
         }
         
+        # ARM64 instructions that only read from first operand (stores)
         self.arm64_read_ops = {
-            'cmp', 'cmn', 'tst', 'str', 'stp', 'strb', 'strh',
+            'str', 'stp', 'strb', 'strh',
+            'cmp', 'cmn', 'tst',
             'b', 'bl', 'br', 'blr', 'ret',
             'cbz', 'cbnz', 'tbz', 'tbnz',
-            'b.eq', 'b.ne', 'b.lt', 'b.le', 'b.gt', 'b.ge', 'b.lo', 'b.hi', 'b.ls', 'b.hs',
-            'svc', 'nop',
+            'b.eq', 'b.ne', 'b.lt', 'b.le', 'b.gt', 'b.ge', 'b.lo', 'b.ls', 'b.hi', 'b.hs',
+            'nop', 'svc',
+            'fcmp', 'fccmp',
         }
-
+        
         # Combined register set for backward compatibility
         self.registers = self.x86_registers
 
@@ -156,17 +154,20 @@ class CAsmConverter:
             return 'arm64'
         if x86_count > 0:
             return 'x86_64'
-        return None
+        return None  # Couldn't determine
     
     def get_block_arch(self, asm_lines):
         """Determine architecture for a block, preferring auto-detection."""
         detected = self.detect_arch(asm_lines)
+        # If we detected an architecture from the code, use it
         if detected:
             return detected
+        # Otherwise fall back to the provided arch or default to x86_64
         return self.arch or 'x86_64'
 
     def convert(self):
         """Main conversion entry point."""
+        # Track all architectures used in this file
         self.detected_archs = set()
         
         i = 0
@@ -175,43 +176,53 @@ class CAsmConverter:
             stripped = line.strip()
             
             # Check for asm( block start
+            # Support: asm(, __asm__(, __asm__ volatile(, asm volatile(
             asm_match = re.match(r'^(\s*)(asm|__asm__|__asm)\s*(volatile\s*)?\(\s*$', stripped, re.IGNORECASE)
             if asm_match:
                 indent = self.get_indent(line)
+                # Collect all lines until closing )
                 asm_lines = []
                 i += 1
                 while i < len(self.lines):
                     asm_line = self.lines[i]
-                    if asm_line.strip() == ')' or asm_line.strip().startswith(')'):
+                    if asm_line.strip() == ')':
+                        i += 1
+                        break
+                    # Also check for ); or ) with trailing stuff
+                    if asm_line.strip().startswith(')'):
                         i += 1
                         break
                     asm_lines.append(asm_line)
                     i += 1
                 
+                # Auto-detect architecture from code (prioritizes code over CLI arg)
                 block_arch = self.get_block_arch(asm_lines)
                 self.detected_archs.add(block_arch)
                 
+                # Convert the asm block based on architecture
                 if block_arch == 'arm64':
                     converted = self.convert_arm64_asm_block(asm_lines, indent)
                 else:
                     converted = self.convert_asm_block(asm_lines, indent)
                 self.output_lines.append(converted)
-            # Check for direct assembly lines
-            elif self.is_assembly_line(stripped):
+            # Check for inline assembly written directly (no asm() wrapper)
+            elif self.is_direct_asm_line(stripped):
                 indent = self.get_indent(line)
+                # Collect consecutive assembly lines
                 asm_lines = [line]
                 i += 1
                 while i < len(self.lines):
                     next_line = self.lines[i]
                     next_stripped = next_line.strip()
-                    if self.is_assembly_line(next_stripped):
+                    if self.is_direct_asm_line(next_stripped):
                         asm_lines.append(next_line)
                         i += 1
                     elif not next_stripped:
+                        # Empty line - check if more asm follows
                         j = i + 1
                         while j < len(self.lines) and not self.lines[j].strip():
                             j += 1
-                        if j < len(self.lines) and self.is_assembly_line(self.lines[j].strip()):
+                        if j < len(self.lines) and self.is_direct_asm_line(self.lines[j].strip()):
                             asm_lines.append(next_line)
                             i += 1
                         else:
@@ -219,9 +230,11 @@ class CAsmConverter:
                     else:
                         break
                 
+                # Auto-detect architecture from code (prioritizes code over CLI arg)
                 block_arch = self.get_block_arch(asm_lines)
                 self.detected_archs.add(block_arch)
                 
+                # Convert the direct asm block
                 if block_arch == 'arm64':
                     converted = self.convert_arm64_asm_block(asm_lines, indent)
                 else:
@@ -231,58 +244,61 @@ class CAsmConverter:
                 self.output_lines.append(line)
                 i += 1
         
-        # Add architecture metadata
+        # Add architecture metadata comment at the top
         arch_list = ','.join(sorted(self.detected_archs)) if self.detected_archs else 'none'
         result = f'// CASM_ARCH: {arch_list}\n' + '\n'.join(self.output_lines)
         return result
 
-    def is_assembly_line(self, stripped):
-        """Check if a line is a direct assembly instruction."""
+    def is_direct_asm_line(self, stripped):
+        """Check if a line is a direct assembly instruction (without asm() wrapper)."""
         if not stripped:
             return False
+        
+        # Skip C++ constructs
         if stripped.startswith('//') or stripped.startswith('/*') or stripped.startswith('*'):
             return False
-        if stripped.startswith('#'):
+        if stripped.startswith('#'):  # preprocessor
             return False
         if stripped.endswith(';') and not stripped.endswith('\\n\\t";'):
-            return False
+            return False  # C++ statement
         if '{' in stripped or '}' in stripped:
             return False
-        # Skip if there's an unbalanced parenthesis (C statement)
-        if '(' in stripped:
-            if stripped.count('(') != stripped.count(')'):
-                return False
-            # Also skip function calls and variable declarations with init
-            if not re.match(r'^\w+\s+\w+,', stripped):
-                return False
+        if '(' in stripped and ')' in stripped and not re.match(r'^\w+\s+\w+,', stripped):
+            return False  # function call or declaration
         if stripped.startswith('return ') or stripped.startswith('if ') or stripped.startswith('else'):
             return False
         if stripped.startswith('for ') or stripped.startswith('while ') or stripped.startswith('switch '):
             return False
-        # Skip C variable declarations
-        c_types = {'int', 'char', 'short', 'long', 'float', 'double', 'void', 'unsigned', 'signed', 
-                   'const', 'static', 'auto', 'register', 'volatile', 'extern', 'size_t', 'ssize_t',
-                   'int8_t', 'int16_t', 'int32_t', 'int64_t', 'uint8_t', 'uint16_t', 'uint32_t', 'uint64_t'}
-        parts = stripped.split()
-        if parts and parts[0] in c_types:
+        if stripped.startswith('class ') or stripped.startswith('struct ') or stripped.startswith('namespace '):
+            return False
+        if '::' in stripped and '[' not in stripped:  # C++ scope resolution (but not asm)
+            return False
+        if stripped.startswith('std::') or 'cout' in stripped or 'cin' in stripped:
             return False
         
-        # Check for labels
+        # Check for labels (word followed by colon, not case:)
         if re.match(r'^[a-zA-Z_]\w*:$', stripped) and not stripped.startswith('case ') and stripped != 'default:':
             return True
         
-        # Get first word and check against known mnemonics
+        # Get first word
         parts = stripped.split()
         if not parts:
             return False
         first_word = parts[0].lower()
         
+        # Check for known assembly mnemonics
         all_mnemonics = set()
+        
+        # x86 mnemonics
         all_mnemonics.update(self.write_ops)
         all_mnemonics.update(self.rmw_ops)
         all_mnemonics.update(self.read_ops)
+        
+        # ARM64 mnemonics
         all_mnemonics.update(self.arm64_write_ops)
         all_mnemonics.update(self.arm64_read_ops)
+        
+        # Additional common mnemonics
         all_mnemonics.update({
             'mov', 'add', 'sub', 'mul', 'div', 'and', 'or', 'xor', 'not', 'neg',
             'push', 'pop', 'call', 'ret', 'jmp', 'je', 'jne', 'jg', 'jl', 'jge', 'jle',
@@ -290,10 +306,16 @@ class CAsmConverter:
             'imul', 'idiv', 'movzx', 'movsx', 'movsxd', 'xchg', 'bswap',
             'ldr', 'str', 'ldp', 'stp', 'lsl', 'lsr', 'asr', 'ror',
             'csel', 'csinc', 'cbz', 'cbnz', 'bl', 'br', 'blr', 'svc',
+            'adc', 'sbb', 'rol', 'rcl', 'rcr', 'bt', 'bts', 'btr', 'btc',
+            'cmovz', 'cmovnz', 'cmove', 'cmovne', 'cmovg', 'cmovl',
+            'sete', 'setne', 'setg', 'setl', 'setge', 'setle',
             'syscall', 'int', 'hlt', 'leave', 'enter',
         })
         
-        return first_word in all_mnemonics
+        if first_word in all_mnemonics:
+            return True
+        
+        return False
 
     def get_indent(self, line):
         """Extract leading whitespace from a line."""
@@ -301,46 +323,80 @@ class CAsmConverter:
         return match.group(1) if match else ''
 
     def convert_asm_block(self, lines, indent):
-        """Convert a block of NASM-style assembly to GCC inline assembly."""
-        block_id = CAsmConverter._asm_block_counter
-        CAsmConverter._asm_block_counter += 1
+        """
+        Convert a block of NASM-style assembly to GCC inline assembly.
         
-        variables = {}
+        Supports advanced features:
+        - push/pop tracking
+        - function calls with ABI handling
+        - array indexing [array + i * 8]
+        - memory clobber detection
+        - local labels with unique names
+        
+        Input (NASM style):
+            mov rax, [num1]
+            add rax, [num2]
+            mov [result], rax
+        
+        Output (GCC inline asm):
+            __asm__ volatile(
+                "movq %1, %%rax\n\t"
+                "addq %2, %%rax\n\t"
+                "movq %%rax, %0\n\t"
+                : "=m" (result)
+                : "m" (num1), "m" (num2)
+                : "rax", "memory"
+            );
+        """
+        # Get unique block ID for this asm block
+        block_id = CppAsmConverter._asm_block_counter
+        CppAsmConverter._asm_block_counter += 1
+        
+        variables = {}  # var_name -> {'index': i, 'read': bool, 'write': bool, 'is_array': bool}
         clobbers = set()
         converted_lines = []
         has_memory_write = False
-        push_count = 0
-        has_call = False
-        local_labels = set()
-        global_labels = {}
+        push_count = 0  # Track push/pop balance
+        has_call = False  # Track if we have function calls
+        local_labels = set()  # Labels local to this block (use %=)
+        global_labels = {}  # Labels accessible from other blocks (use block-specific name)
         
-        # First pass: collect labels
+        # First pass: collect labels and analyze
+        # Labels can be marked as global with @global or global_ prefix
         for line in lines:
             stripped = line.strip()
             if stripped.endswith(':') and not stripped.startswith('case '):
                 label_part = stripped[:-1]
+                
+                # Check for @global annotation
                 if '@global' in label_part:
                     label_name = label_part.replace('@global', '').strip()
                     unique_name = f'.L_casm_global_{label_name}'
                     global_labels[label_name] = unique_name
-                    CAsmConverter._global_labels[label_name] = unique_name
+                    CppAsmConverter._global_labels[label_name] = unique_name
+                # Check for global_ prefix
                 elif label_part.startswith('global_'):
-                    unique_name = f'.L_casm_{label_part}'
-                    global_labels[label_part] = unique_name
-                    CAsmConverter._global_labels[label_part] = unique_name
+                    label_name = label_part
+                    unique_name = f'.L_casm_{label_name}'
+                    global_labels[label_name] = unique_name
+                    CppAsmConverter._global_labels[label_name] = unique_name
                 else:
+                    # Local label - will use %= suffix
                     local_labels.add(label_part)
         
         for line in lines:
             stripped = line.strip()
             
+            # Skip empty lines and comments
             if not stripped or stripped.startswith(';') or stripped.startswith('//'):
                 continue
             
             # Handle inline comments
+            comment = ""
             if ';' in stripped:
                 parts = stripped.split(';', 1)
                 stripped = parts[0].strip()
+                comment = " // " + parts[1].strip()
             
             if not stripped:
                 continue
@@ -348,14 +404,18 @@ class CAsmConverter:
             # Handle labels
             if stripped.endswith(':') and not stripped.startswith('case '):
                 label_part = stripped[:-1]
+                
+                # Check for @global annotation
                 if '@global' in label_part:
                     label_name = label_part.replace('@global', '').strip()
                     unique_name = global_labels.get(label_name, f'.L_casm_global_{label_name}')
                     converted_lines.append(f'"{unique_name}:\\n\\t"')
+                # Check for global_ prefix
                 elif label_part.startswith('global_'):
                     unique_name = global_labels.get(label_part, f'.L_casm_{label_part}')
                     converted_lines.append(f'"{unique_name}:\\n\\t"')
                 else:
+                    # Local label - use %= for unique suffix in GCC inline asm
                     converted_lines.append(f'".L_casm_{label_part}_%=:\\n\\t"')
                 continue
             
@@ -366,6 +426,8 @@ class CAsmConverter:
                 
             mnemonic = parts[0].lower()
             operands_str = parts[1] if len(parts) > 1 else ""
+            
+            # Parse operands (handle commas, but be careful with brackets)
             operands = self.parse_operands(operands_str)
             
             # Track push/pop
@@ -377,45 +439,58 @@ class CAsmConverter:
             # Track function calls
             if mnemonic == 'call':
                 has_call = True
+                # Add caller-saved registers to clobbers (System V AMD64 ABI)
                 clobbers.update(['rax', 'rcx', 'rdx', 'rsi', 'rdi', 'r8', 'r9', 'r10', 'r11'])
-                has_memory_write = True
+                has_memory_write = True  # Calls may modify memory
             
-            # Check for memory writes
+            # Check for memory writes (stores to [var])
             if operands and mnemonic in self.write_ops:
                 dest = operands[0]
                 if dest.startswith('[') and dest.endswith(']'):
                     has_memory_write = True
             
-            # Determine instruction suffix
+            # Determine instruction suffix based on operand sizes
             suffix = self.determine_suffix(mnemonic, operands)
             
             # Track variables and clobbers
             self.analyze_operands(mnemonic, operands, variables, clobbers)
             
-            # Convert operands to AT&T format
+            # Convert each operand to AT&T format
             att_operands = []
             for op in operands:
                 att_op = self.convert_operand(op, mnemonic)
-                # Update jump targets
+                
+                # Update jump/call targets to use appropriate labels
                 if mnemonic in {'jmp', 'je', 'jne', 'jz', 'jnz', 'jg', 'jge', 'jl', 'jle',
                                'ja', 'jae', 'jb', 'jbe', 'jo', 'jno', 'js', 'jns', 'jp', 'jnp',
                                'loop', 'loope', 'loopne', 'loopz', 'loopnz', 'call'}:
+                    # Check if it's a local label
                     if op in local_labels:
                         att_op = f'.L_casm_{op}_%='
+                    # Check if it's a global label (defined in this block)
                     elif op in global_labels:
                         att_op = global_labels[op]
-                    elif op in CAsmConverter._global_labels:
-                        att_op = CAsmConverter._global_labels[op]
+                    # Check if it's a global label (defined in another block)
+                    elif op in CppAsmConverter._global_labels:
+                        att_op = CppAsmConverter._global_labels[op]
+                    # Check for global_ prefix
+                    elif op.startswith('global_'):
+                        att_op = f'.L_casm_{op}'
+                
                 att_operands.append(att_op)
             
-            # Reverse operand order for AT&T (except for single-operand instructions)
+            # AT&T uses reversed operand order (src, dest) for most instructions
+            # For 2-operand instructions: reverse to (src, dest)
+            # For 3-operand imul: imul dest, src, imm -> imulq $imm, src, dest
             if len(att_operands) == 2 and mnemonic not in {'push', 'pop', 'call', 'jmp'}:
                 att_operands.reverse()
             elif len(att_operands) == 3:
-                # Three-operand: dest, src, imm -> imm, src, dest
+                # Three-operand instructions (like imul rax, rbx, 3 -> imulq $3, %rbx, %rax)
+                # NASM: dest, src, imm -> AT&T: imm, src, dest
                 att_operands = [att_operands[2], att_operands[1], att_operands[0]]
             
             # Build the instruction string
+            # Note: Comments are not preserved in inline asm to avoid syntax issues
             att_mnemonic = mnemonic + suffix
             if att_operands:
                 asm_instr = f'"{att_mnemonic} {", ".join(att_operands)}\\n\\t"'
@@ -424,22 +499,24 @@ class CAsmConverter:
             
             converted_lines.append(asm_instr)
         
-        # Add stack alignment for calls if needed
+        # Add stack alignment for calls if push/pop is unbalanced
         if has_call and push_count != 0:
-            converted_lines.insert(0, '"subq $8, %%rsp\\n\\t"')
-            converted_lines.append('"addq $8, %%rsp\\n\\t"')
+            # Insert stack alignment at the beginning
+            converted_lines.insert(0, '"subq $8, %%rsp\\n\\t"  // Stack alignment for call')
+            converted_lines.append('"addq $8, %%rsp\\n\\t"  // Restore stack')
         
-        # Add memory clobber
+        # Add memory clobber if we write to memory
         if has_memory_write:
             clobbers.add('memory')
         
         # Build constraint lists
         outputs, inputs, var_to_index = self.build_constraints(variables)
         
-        # Replace variable placeholders
+        # Replace variable placeholders with operand indices
         final_lines = []
         for line in converted_lines:
             for var_name, idx in var_to_index.items():
+                # Replace [var] patterns that were converted to __VAR_var__
                 line = re.sub(f'__VAR_{re.escape(var_name)}__', f'%{idx}', line)
             final_lines.append(line)
         
@@ -469,16 +546,16 @@ class CAsmConverter:
         
         operands = []
         current = ""
-        depth = 0
+        bracket_depth = 0
         
         for char in operands_str:
             if char == '[':
-                depth += 1
+                bracket_depth += 1
                 current += char
             elif char == ']':
-                depth -= 1
+                bracket_depth -= 1
                 current += char
-            elif char == ',' and depth == 0:
+            elif char == ',' and bracket_depth == 0:
                 operands.append(current.strip())
                 current = ""
             else:
@@ -490,18 +567,20 @@ class CAsmConverter:
         return operands
 
     def determine_suffix(self, mnemonic, operands):
-        """Determine the AT&T instruction suffix."""
+        """Determine the AT&T instruction suffix based on operand sizes."""
+        # Instructions that don't need suffixes
         no_suffix_ops = {
             'jmp', 'je', 'jne', 'jg', 'jge', 'jl', 'jle', 'ja', 'jae', 'jb', 'jbe',
             'jz', 'jnz', 'jo', 'jno', 'js', 'jns', 'jp', 'jnp',
             'call', 'ret', 'leave', 'nop', 'hlt', 'syscall', 'int',
-            'loop', 'loope', 'loopne', 'push', 'pop',
+            'loop', 'loope', 'loopne',
+            'push', 'pop',  # These infer size from operand
         }
         
         if mnemonic in no_suffix_ops:
             return ''
         
-        # Check for explicit size
+        # Check for explicit size specifiers in operands
         for op in operands:
             op_lower = op.lower()
             if 'byte' in op_lower:
@@ -515,87 +594,114 @@ class CAsmConverter:
         
         # Check operands for register sizes
         for op in operands:
+            # Strip size prefixes
             clean_op = re.sub(r'\b(byte|word|dword|qword)\s+(ptr\s+)?', '', op, flags=re.IGNORECASE).strip()
+            # Check if it's a register
             reg = clean_op.lower()
-            if reg in self.x86_registers:
-                return self.x86_registers[reg]
+            if reg in self.registers:
+                return self.registers[reg]
         
+        # Default to qword (64-bit) for modern x86-64
         return 'q'
 
     def analyze_operands(self, mnemonic, operands, variables, clobbers):
         """Analyze operands to track variable usage and register clobbers."""
+        # First operand (Intel dest)
         if operands:
             dest = operands[0]
             is_write = mnemonic in self.write_ops
             is_read = mnemonic in self.rmw_ops
             self.track_operand(dest, is_read, is_write, variables, clobbers)
         
+        # Second operand (Intel src)
         if len(operands) > 1:
             src = operands[1]
             self.track_operand(src, True, False, variables, clobbers)
 
     def track_operand(self, op, is_read, is_write, variables, clobbers):
         """Track an operand for variable references and register clobbers."""
+        # Strip size specifiers
         op = re.sub(r'\b(byte|word|dword|qword)\s+(ptr\s+)?', '', op, flags=re.IGNORECASE).strip()
         
-        # Check for [var] pattern
+        # Check for [var] pattern - C++ variable reference
         var_match = re.match(r'^\[([a-zA-Z_][a-zA-Z0-9_]*)\]$', op)
         if var_match:
             var_name = var_match.group(1)
-            if var_name.lower() not in self.x86_registers:
+            # Skip if it's a register
+            if var_name.lower() not in self.registers:
                 self.track_variable(var_name, is_read, is_write, variables)
             return
         
-        # Check for memory operands with complex addressing
+        # Check for memory operands with complex addressing [base + offset]
         if '[' in op and ']' in op:
+            # Extract content inside brackets
             match = re.search(r'\[(.*?)\]', op)
             if match:
                 content = match.group(1)
+                
+                # Parse the memory expression to identify base vs index
+                # Pattern: base + index * scale + displacement
+                # or: base + displacement
+                
+                # Split on + and - while preserving the operators
                 parts = re.split(r'([+\-])', content)
                 parts = [p.strip() for p in parts if p.strip()]
                 
+                # First non-operator part is typically the base
                 first_token = True
-                for part in parts:
+                for i, part in enumerate(parts):
                     if part in '+-':
                         continue
                     
+                    # Check for index*scale pattern
                     scale_match = re.match(r'([a-zA-Z_][a-zA-Z0-9_]*)\s*\*\s*\d+', part)
                     if scale_match:
                         token = scale_match.group(1)
-                        if token.lower() not in self.x86_registers:
+                        if token.lower() not in self.registers:
+                            # This is a variable used as array index
                             self.track_variable(token, True, False, variables, is_array_index=True)
                         continue
                     
+                    # Check for scale*index pattern
                     scale_match2 = re.match(r'\d+\s*\*\s*([a-zA-Z_][a-zA-Z0-9_]*)', part)
                     if scale_match2:
                         token = scale_match2.group(1)
-                        if token.lower() not in self.x86_registers:
+                        if token.lower() not in self.registers:
                             self.track_variable(token, True, False, variables, is_array_index=True)
                         continue
                     
+                    # Check if it's a simple identifier (variable or register)
                     if re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', part):
-                        if part.lower() not in self.x86_registers:
+                        if part.lower() not in self.registers:
                             if first_token:
+                                # First identifier is likely the array base
+                                # Memory operations on array are read/write based on instruction
                                 self.track_variable(part, True, False, variables, is_array_base=True)
                             else:
+                                # Additional identifiers are indices
                                 self.track_variable(part, True, False, variables, is_array_index=True)
                     
                     first_token = False
             return
         
-        # Check for register
+        # Check for register - add to clobbers if written
         reg = op.lower()
-        if reg in self.x86_registers:
+        if reg in self.registers:
             if is_write:
                 clobbers.add(self.normalize_register(reg))
             return
         
-        # Check for bare identifier (C variable without brackets)
-        if re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', op):
-            self.track_variable(op, is_read, is_write, variables)
+        # Check for immediate values
+        if op.startswith('0x') or op.startswith('0X') or op.isdigit() or \
+           (op.startswith('-') and op[1:].isdigit()):
+            return
+        
+        # Check for labels (used in jumps/calls)
+        if not op.startswith('['):
+            return
 
     def track_variable(self, name, is_read, is_write, variables, is_array_base=False, is_array_index=False):
-        """Track a C variable for constraint generation."""
+        """Track a C++ variable for constraint generation."""
         if name not in variables:
             variables[name] = {
                 'index': len(variables), 
@@ -615,7 +721,7 @@ class CAsmConverter:
             variables[name]['is_array_index'] = True
 
     def normalize_register(self, reg):
-        """Normalize register to its 64-bit parent."""
+        """Normalize register to its 64-bit parent for clobber list."""
         reg = reg.lower()
         mapping = {
             'eax': 'rax', 'ax': 'rax', 'al': 'rax', 'ah': 'rax',
@@ -639,24 +745,27 @@ class CAsmConverter:
 
     def convert_operand(self, op, mnemonic):
         """Convert a NASM operand to AT&T format."""
+        # Strip size specifiers but remember them
         op = re.sub(r'\b(byte|word|dword|qword)\s+(ptr\s+)?', '', op, flags=re.IGNORECASE).strip()
         
-        # Handle [var] - C variable
+        # Handle [var] - C++ variable (memory operand)
         var_match = re.match(r'^\[([a-zA-Z_][a-zA-Z0-9_]*)\]$', op)
         if var_match:
             var_name = var_match.group(1)
-            if var_name.lower() not in self.x86_registers:
+            if var_name.lower() not in self.registers:
+                # Use a placeholder that will be replaced with the operand index
                 return f'__VAR_{var_name}__'
             else:
+                # It's a register used as a pointer: [rax] -> (%%rax)
                 return f'(%%{var_name.lower()})'
         
-        # Handle complex memory operands
+        # Handle complex memory operands [base + index*scale + disp]
         if '[' in op and ']' in op:
             return self.convert_memory_operand(op)
         
         # Handle registers
         reg = op.lower()
-        if reg in self.x86_registers:
+        if reg in self.registers:
             return f'%%{reg}'
         
         # Handle immediates
@@ -665,125 +774,192 @@ class CAsmConverter:
         if op.isdigit() or (op.startswith('-') and op[1:].isdigit()):
             return f'${op}'
         
-        # Handle labels (for jumps/calls)
-        if mnemonic in {'jmp', 'je', 'jne', 'jz', 'jnz', 'jg', 'jge', 'jl', 'jle',
-                       'ja', 'jae', 'jb', 'jbe', 'call', 'loop'}:
-            return op
-        
-        # Handle bare identifier (C variable without brackets)
-        if re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', op):
-            return f'__VAR_{op}__'
-        
+        # Labels (for jumps/calls)
         return op
 
     def convert_memory_operand(self, op):
-        """Convert complex memory addressing to AT&T format."""
+        """
+        Convert NASM memory operand [base + index*scale + disp] to AT&T format.
+        
+        Supports:
+        - [rax]                  -> (%%rax)
+        - [rax + 8]              -> 8(%%rax)
+        - [rax + rbx*4]          -> (%%rax, %%rbx, 4)
+        - [rax + rbx*4 + 16]     -> 16(%%rax, %%rbx, 4)
+        - [array]                -> __VAR_array__ (variable)
+        - [array + i*8]          -> (__VAR_array__, __VAR_i__, 8) (array indexing)
+        - [rax + i*8]            -> (%%rax, __VAR_i__, 8) (register + var index)
+        """
         match = re.search(r'\[(.*?)\]', op)
         if not match:
             return op
         
-        content = match.group(1)
+        content = match.group(1).strip()
+        
         base = None
+        base_is_var = False
         index = None
+        index_is_var = False
         scale = None
-        displacement = ""
+        disp = None
+        disp_parts = []
         
-        parts = re.split(r'([+\-])', content)
-        parts = [p.strip() for p in parts if p.strip()]
-        
+        # Split by + and - while keeping the sign
+        parts = re.split(r'(\+|-)', content)
         current_sign = '+'
+        
         for part in parts:
+            part = part.strip()
             if part == '+':
                 current_sign = '+'
                 continue
             elif part == '-':
                 current_sign = '-'
                 continue
+            elif not part:
+                continue
             
-            # Check for index*scale pattern
+            # Check for scale: var*n or n*var or reg*n or n*reg
             scale_match = re.match(r'([a-zA-Z_][a-zA-Z0-9_]*)\s*\*\s*(\d+)', part)
             if scale_match:
                 idx_name = scale_match.group(1)
                 scale = scale_match.group(2)
-                if idx_name.lower() in self.x86_registers:
-                    index = f'%%{idx_name.lower()}'
+                if idx_name.lower() in self.registers:
+                    index = idx_name.lower()
+                    index_is_var = False
                 else:
-                    index = f'__VAR_{idx_name}__'
+                    index = idx_name
+                    index_is_var = True
                 continue
             
-            # Check for scale*index pattern
-            scale_match2 = re.match(r'(\d+)\s*\*\s*([a-zA-Z_][a-zA-Z0-9_]*)', part)
-            if scale_match2:
-                scale = scale_match2.group(1)
-                idx_name = scale_match2.group(2)
-                if idx_name.lower() in self.x86_registers:
-                    index = f'%%{idx_name.lower()}'
+            scale_match = re.match(r'(\d+)\s*\*\s*([a-zA-Z_][a-zA-Z0-9_]*)', part)
+            if scale_match:
+                scale = scale_match.group(1)
+                idx_name = scale_match.group(2)
+                if idx_name.lower() in self.registers:
+                    index = idx_name.lower()
+                    index_is_var = False
                 else:
-                    index = f'__VAR_{idx_name}__'
+                    index = idx_name
+                    index_is_var = True
                 continue
             
             # Check if it's a register
-            if part.lower() in self.x86_registers:
+            if part.lower() in self.registers:
                 if base is None:
-                    base = f'%%{part.lower()}'
+                    base = part.lower()
+                    base_is_var = False
                 elif index is None:
-                    index = f'%%{part.lower()}'
-                    scale = '1'
+                    index = part.lower()
+                    index_is_var = False
                 continue
             
-            # Check if it's a number
-            if part.isdigit() or (part.startswith('0x')):
-                if current_sign == '-':
-                    displacement = f'-{part}'
+            # Check if it's a number (displacement)
+            if part.isdigit():
+                disp_val = int(part) if current_sign == '+' else -int(part)
+                if disp is None:
+                    disp = disp_val
                 else:
-                    displacement = part
+                    disp += disp_val
                 continue
             
-            # It's a variable
-            if base is None:
-                base = f'__VAR_{part}__'
-            elif index is None:
-                index = f'__VAR_{part}__'
-                scale = '1'
+            # Check for hex numbers
+            if part.startswith('0x') or part.startswith('0X'):
+                try:
+                    disp_val = int(part, 16) if current_sign == '+' else -int(part, 16)
+                    if disp is None:
+                        disp = disp_val
+                    else:
+                        disp += disp_val
+                    continue
+                except ValueError:
+                    pass
+            
+            # It's a variable name (could be array base or index)
+            if re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', part):
+                if part.lower() not in self.registers:
+                    if base is None:
+                        base = part
+                        base_is_var = True
+                    elif index is None:
+                        index = part
+                        index_is_var = True
+                else:
+                    if base is None:
+                        base = part.lower()
+                        base_is_var = False
+                    elif index is None:
+                        index = part.lower()
+                        index_is_var = False
         
-        # Build AT&T format: displacement(base, index, scale)
+        # Build AT&T format: disp(base, index, scale)
         result = ""
-        if displacement:
-            result = displacement
         
+        # Handle displacement
+        if disp is not None and disp != 0:
+            result += str(disp)
+        
+        # Build the addressing mode
         if base or index:
-            result += f'({base or ""}' 
+            result += "("
+            if base:
+                if base_is_var:
+                    result += f"__VAR_{base}__"
+                else:
+                    result += f"%%{base}"
             if index:
-                result += f', {index}'
-                if scale and scale != '1':
-                    result += f', {scale}'
-            result += ')'
+                if base:
+                    result += ", "
+                if index_is_var:
+                    result += f"__VAR_{index}__"
+                else:
+                    result += f"%%{index}"
+                if scale:
+                    result += f", {scale}"
+            result += ")"
         
-        return result if result else '0'
+        return result if result else "0"
 
     def build_constraints(self, variables):
-        """Build output and input constraint lists."""
+        """Build output and input constraint lists for inline assembly."""
         outputs = []
         inputs = []
         var_to_index = {}
         current_idx = 0
         
+        # Sort variables by their first appearance order
         sorted_vars = sorted(variables.items(), key=lambda x: x[1]['index'])
         
-        # First pass: outputs
+        # First pass: outputs (written variables)
         for var_name, info in sorted_vars:
             if info['write']:
-                if info['read']:
+                # Array bases need special handling - they hold an address
+                if info.get('is_array_base'):
+                    if info['read']:
+                        outputs.append(f'"+r" ({var_name})')
+                    else:
+                        outputs.append(f'"=r" ({var_name})')
+                elif info['read']:
+                    # Read-modify-write: use +r constraint
                     outputs.append(f'"+r" ({var_name})')
                 else:
+                    # Write-only: use =r constraint
                     outputs.append(f'"=r" ({var_name})')
                 var_to_index[var_name] = current_idx
                 current_idx += 1
         
-        # Second pass: inputs
+        # Second pass: inputs (read-only variables)
         for var_name, info in sorted_vars:
             if not info['write'] and info['read']:
-                inputs.append(f'"r" ({var_name})')
+                # Array bases should use "r" to get the address in a register
+                if info.get('is_array_base'):
+                    inputs.append(f'"r" ({var_name})')
+                # Array indices should use "r" to get the value in a register  
+                elif info.get('is_array_index'):
+                    inputs.append(f'"r" ({var_name})')
+                else:
+                    # Regular memory operands
+                    inputs.append(f'"r" ({var_name})')
                 var_to_index[var_name] = current_idx
                 current_idx += 1
         
@@ -794,90 +970,93 @@ class CAsmConverter:
     # =========================================================================
     
     def convert_arm64_asm_block(self, lines, indent):
-        """Convert ARM64 assembly to GCC inline assembly."""
-        variables = {}
+        """
+        Convert a block of ARM64 assembly to GCC inline assembly.
+        
+        ARM64 assembly already uses a syntax similar to what GCC expects,
+        but we need to:
+        1. Map C++ variables [var] to operand placeholders
+        2. Track register clobbers
+        3. Generate proper constraints
+        
+        Input:
+            ldr x0, [num1]
+            ldr x1, [num2]
+            add x0, x0, x1
+            str x0, [result]
+        
+        Output:
+            __asm__ volatile(
+                "ldr x0, %1\n\t"
+                "ldr x1, %2\n\t"
+                "add x0, x0, x1\n\t"
+                "str x0, %0\n\t"
+                : "=m" (result)
+                : "m" (num1), "m" (num2)
+                : "x0", "x1"
+            );
+        """
+        variables = {}  # var_name -> {'index': i, 'read': bool, 'write': bool}
         clobbers = set()
         converted_lines = []
-        has_memory_write = False
-        local_labels = set()
-        
-        # First pass: collect labels
-        for line in lines:
-            stripped = line.strip()
-            if stripped.endswith(':') and not stripped.startswith('case '):
-                label_name = stripped[:-1]
-                local_labels.add(label_name)
         
         for line in lines:
             stripped = line.strip()
             
+            # Skip empty lines and comments
             if not stripped or stripped.startswith(';') or stripped.startswith('//'):
                 continue
             
             # Handle inline comments
-            if ';' in stripped:
-                stripped = stripped.split(';', 1)[0].strip()
+            comment = ""
             if '//' in stripped:
-                stripped = stripped.split('//', 1)[0].strip()
+                parts = stripped.split('//', 1)
+                stripped = parts[0].strip()
+                comment = " // " + parts[1].strip()
             
             if not stripped:
                 continue
             
             # Handle labels
             if stripped.endswith(':') and not stripped.startswith('case '):
-                label_name = stripped[:-1]
-                converted_lines.append(f'".L_casm_{label_name}_%=:\\n\\t"')
+                converted_lines.append(f'"{stripped}\\n\\t"')
                 continue
             
             # Parse instruction
             parts = stripped.split(None, 1)
             if not parts:
                 continue
-            
+                
             mnemonic = parts[0].lower()
             operands_str = parts[1] if len(parts) > 1 else ""
-            operands = [o.strip() for o in operands_str.split(',') if o.strip()]
+            
+            # Parse operands
+            operands = self.parse_arm64_operands(operands_str)
             
             # Track variables and clobbers
-            for op in operands:
-                var_match = re.match(r'^\[([a-zA-Z_][a-zA-Z0-9_]*)\]$', op)
-                if var_match:
-                    var_name = var_match.group(1)
-                    if var_name.lower() not in self.arm64_registers:
-                        is_write = mnemonic in {'str', 'stp', 'strb', 'strh'}
-                        is_read = mnemonic in {'ldr', 'ldp', 'ldrb', 'ldrh', 'ldrsb', 'ldrsh', 'ldrsw'}
-                        self.track_variable(var_name, is_read, is_write, variables)
-                        if is_write:
-                            has_memory_write = True
-                elif op.lower() in self.arm64_registers:
-                    if mnemonic in self.arm64_write_ops:
-                        clobbers.add(op.lower())
+            self.analyze_arm64_operands(mnemonic, operands, variables, clobbers)
             
-            # Convert operands
-            att_operands = []
+            # Convert operands (mainly handling [var] patterns)
+            converted_ops = []
             for op in operands:
-                att_op = self.convert_arm64_operand(op, mnemonic)
-                if mnemonic in {'b', 'bl', 'cbz', 'cbnz', 'tbz', 'tbnz',
-                               'b.eq', 'b.ne', 'b.lt', 'b.gt', 'b.le', 'b.ge'}:
-                    if op in local_labels:
-                        att_op = f'.L_casm_{op}_%='
-                att_operands.append(att_op)
+                converted_op = self.convert_arm64_operand(op)
+                converted_ops.append(converted_op)
             
-            # Build instruction
-            if att_operands:
-                asm_instr = f'"{mnemonic} {", ".join(att_operands)}\\n\\t"'
+            # Build the instruction string
+            if converted_ops:
+                asm_instr = f'"{mnemonic} {", ".join(converted_ops)}\\n\\t"'
             else:
                 asm_instr = f'"{mnemonic}\\n\\t"'
             
+            if comment:
+                asm_instr = asm_instr[:-1] + comment + '"'
+            
             converted_lines.append(asm_instr)
-        
-        if has_memory_write:
-            clobbers.add('memory')
         
         # Build constraint lists
         outputs, inputs, var_to_index = self.build_constraints(variables)
         
-        # Replace variable placeholders
+        # Replace variable placeholders with operand indices
         final_lines = []
         for line in converted_lines:
             for var_name, idx in var_to_index.items():
@@ -903,39 +1082,113 @@ class CAsmConverter:
         
         return result
 
-    def convert_arm64_operand(self, op, mnemonic=''):
-        """Convert ARM64 operand format."""
-        op = op.strip()
+    def parse_arm64_operands(self, operands_str):
+        """Parse ARM64 operands, respecting brackets."""
+        if not operands_str:
+            return []
         
-        # Handle [var] - C variable
+        operands = []
+        current = ""
+        bracket_depth = 0
+        
+        for char in operands_str:
+            if char == '[':
+                bracket_depth += 1
+                current += char
+            elif char == ']':
+                bracket_depth -= 1
+                current += char
+            elif char == ',' and bracket_depth == 0:
+                operands.append(current.strip())
+                current = ""
+            else:
+                current += char
+        
+        if current.strip():
+            operands.append(current.strip())
+        
+        return operands
+
+    def analyze_arm64_operands(self, mnemonic, operands, variables, clobbers):
+        """Analyze ARM64 operands for variable usage and clobbers."""
+        # First operand is usually the destination for most instructions
+        if operands:
+            dest = operands[0]
+            is_write = mnemonic in self.arm64_write_ops
+            is_read = mnemonic not in {'mov', 'movz', 'movn', 'ldr', 'ldp', 'ldrb', 'ldrh'}
+            self.track_arm64_operand(dest, is_read, is_write, variables, clobbers)
+        
+        # Remaining operands are usually sources
+        for op in operands[1:]:
+            # Check for store instructions where the first operand is actually the source
+            if mnemonic in {'str', 'stp', 'strb', 'strh'}:
+                # For store, first operand is source (read), memory operand is dest (write)
+                if '[' in op:
+                    self.track_arm64_operand(op, False, True, variables, clobbers)
+                else:
+                    self.track_arm64_operand(op, True, False, variables, clobbers)
+            else:
+                self.track_arm64_operand(op, True, False, variables, clobbers)
+
+    def track_arm64_operand(self, op, is_read, is_write, variables, clobbers):
+        """Track an ARM64 operand for variables and clobbers."""
+        # Check for [var] pattern - C++ variable reference
         var_match = re.match(r'^\[([a-zA-Z_][a-zA-Z0-9_]*)\]$', op)
         if var_match:
             var_name = var_match.group(1)
             if var_name.lower() not in self.arm64_registers:
-                return f'__VAR_{var_name}__'
-            else:
-                return f'[{var_name}]'
+                self.track_variable(var_name, is_read, is_write, variables)
+            return
         
-        # Handle complex memory operands [reg, #offset]
+        # Check for memory operands with register base [x0], [x0, #offset], etc.
         if '[' in op and ']' in op:
-            match = re.search(r'\[([^,\]]+)(?:,\s*#?(-?\d+))?\](!)?', op)
+            match = re.search(r'\[(.*?)\]', op)
             if match:
-                base = match.group(1).strip()
-                offset = match.group(2) if match.group(2) else '0'
-                writeback = match.group(3) if match.group(3) else ''
-                
-                if base.lower() in self.arm64_registers:
-                    return f'[{base}, #{offset}]{writeback}'
-                else:
-                    return f'__VAR_{base}__'
+                content = match.group(1)
+                # Check if it's a variable
+                tokens = re.findall(r'[a-zA-Z_][a-zA-Z0-9_]*', content)
+                for token in tokens:
+                    if token.lower() not in self.arm64_registers:
+                        self.track_variable(token, True, is_write, variables)
+            return
         
-        # Handle immediate with #
+        # Check for register - add to clobbers if written
+        reg = op.lower()
+        # Handle register with optional suffix like x0.8b
+        base_reg = reg.split('.')[0]
+        if base_reg in self.arm64_registers:
+            if is_write:
+                clobbers.add(base_reg)
+            return
+
+    def convert_arm64_operand(self, op, mnemonic=''):
+        """Convert an ARM64 operand, handling variable references."""
+        # Handle [var] - C++ variable reference
+        var_match = re.match(r'^\[([a-zA-Z_][a-zA-Z0-9_]*)\]$', op)
+        if var_match:
+            var_name = var_match.group(1)
+            if var_name.lower() not in self.arm64_registers:
+                # For mov instructions, we want to use the value directly
+                return f'__VAR_{var_name}__'
+            # It's a register: [x0] stays as [x0]
+            return op
+        
+        # Handle memory operands [reg, #offset] etc.
+        if '[' in op and ']' in op:
+            match = re.search(r'\[([^\]]*)\]', op)
+            if match:
+                content = match.group(1)
+                # Check if content contains a variable
+                tokens = re.findall(r'[a-zA-Z_][a-zA-Z0-9_]*', content)
+                for token in tokens:
+                    if token.lower() not in self.arm64_registers:
+                        # Replace variable with placeholder
+                        content = re.sub(rf'\b{re.escape(token)}\b', f'__VAR_{token}__', content)
+                return f'[{content}]'
+        
+        # Handle immediate with # prefix
         if op.startswith('#'):
             return op
         
-        # Handle registers
-        if op.lower() in self.arm64_registers:
-            return op
-        
+        # Other operands pass through unchanged
         return op
-

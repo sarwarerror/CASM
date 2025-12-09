@@ -5,22 +5,30 @@ A contemporary, high-level assembly compiler with cross-platform support. Write 
 - **High-Level Constructs**: `if/elif/else`, `for`, `while`, `func`, nested loops
 - **Backend Abstraction**: Modular architecture supporting multiple platforms
 - **Cross-Platform**: Native support for Windows, Linux, and macOS (x86-64)
-- **ARM64 Support**: In-progress native Apple Silicon support
+- **ARM64 Support**: Native Apple Silicon support
+- **C/C++ Inline Assembly**: Write NASM-style assembly in C/C++ files with automatic conversion to GCC inline assembly
+- **Direct Assembly Mode**: Write assembly directly in C/C++ without `asm()` wrappers
 - **Standard Library**: Automatic dependency injection - only includes what you use
 - **Inline Assembly**: Seamless NASM passthrough for low-level control
 - **Smart Register Allocation**: Automatic allocation with callee-saved register preference
 
-### Enhanced Cross-Compilation
+### Supported File Types
+- `.asm` - Assembly source with high-level syntax
+- `.cpp` - C++ with inline assembly (NASM/ARM64 syntax)
+- `.c` - C with inline assembly (NASM/ARM64 syntax)
+
+### Cross-Compilation Support
 - Windows (x86-64) - Working
 - macOS (x86-64) - Working
-- Linux (x86-64) - Partial (requires cross-linker)
-- macOS (ARM64) - In progress
+- macOS (ARM64) - Working
+- Linux (x86-64) - Working
+- Linux (ARM64) - Working
 
 ## Prerequisites
 
 - **Python 3.8+**
 - **NASM** - Assembly generation (x86-64)
-- **GCC/Clang** - Linking executables
+- **GCC/Clang** - Linking executables and compiling C/C++ files
 - **Cross-platform toolchains** (optional):
   - Windows: MinGW-w64 (`brew install mingw-w64`)
   - macOS: Xcode Command Line Tools
@@ -31,8 +39,12 @@ A contemporary, high-level assembly compiler with cross-platform support. Write 
 ### Basic Usage
 
 ```bash
-# Compile and run
+# Compile and run assembly
 python3 main.py examples/hello.asm --build --run
+
+# Compile C/C++ with inline assembly
+python3 main.py examples/simple_c_test.c --build --run
+python3 main.py examples/simple_advanced_test.cpp --build --run
 
 # Cross-compile for different platforms
 python3 main.py code.asm --build --target windows
@@ -41,19 +53,97 @@ python3 main.py code.asm --build --target linux
 
 # Specify architecture (x86_64 or arm64)
 python3 main.py code.asm --build --target macos --arch arm64
+python3 main.py code.cpp --build --target macos --arch x86_64
 ```
 
 ### Global Installation (Optional)
 
 ```bash
-chmod +x inshall.sh
-sudo ./inshall.sh
+chmod +x install.sh
+sudo ./install.sh
 
 # Use globally
 casm examples/hello.asm --build --run
 ```
 
-## Language Reference
+## C/C++ Inline Assembly
+
+CASM supports writing NASM-style inline assembly in C and C++ files. The compiler automatically converts NASM syntax to GCC inline assembly.
+
+### Using asm() Blocks
+
+```c
+int calculate(int x, int y) {
+    int result;
+    
+    asm(
+        mov eax, x
+        add eax, y
+        imul eax, eax, 2
+        mov result, eax
+    );
+    
+    return result;
+}
+```
+
+### Direct Assembly Mode (No asm() wrapper)
+
+Write assembly directly in your C/C++ functions:
+
+```c
+int asmStrlen(char* str) {
+    int len;
+    
+    xor rcx, rcx
+    mov rdi, str
+.len_loop:
+    mov al, byte ptr [rdi + rcx]
+    test al, al
+    jz .len_done
+    inc rcx
+    jmp .len_loop
+.len_done:
+    mov len, ecx
+    
+    return len;
+}
+```
+
+### Features
+
+- **Variable References**: Use C/C++ variables directly in assembly
+- **Push/Pop Tracking**: Automatic register clobber detection
+- **Local Labels**: Use `.label:` syntax with automatic unique suffixes
+- **Array Indexing**: Support for `[arr + rcx*4]` style addressing
+- **Architecture Detection**: Auto-detects x86_64 vs ARM64 from code
+- **Memory Clobber**: Automatically added for memory operations
+
+### Example: Array Sum with Local Labels
+
+```c
+int sum_array(int* arr, int len) {
+    int total = 0;
+    
+    asm(
+        xor eax, eax
+        xor rcx, rcx
+    .loop_start:
+        cmp ecx, len
+        jge .loop_end
+        mov edx, [arr + rcx*4]
+        add eax, edx
+        inc rcx
+        jmp .loop_start
+    .loop_end:
+        mov total, eax
+    );
+    
+    return total;
+}
+```
+
+## Language Reference (Assembly)
 
 ### Control Flow
 
@@ -146,8 +236,21 @@ section .text
 │   ├── token.py          # Token definitions
 │   ├── codegen.py        # Code generation
 │   ├── backend.py        # Backend abstraction
-│   └── builder.py        # Assembly & linking
+│   ├── builder.py        # Assembly & linking
+│   ├── c_asm_converter.py    # C inline asm converter
+│   └── cpp_asm_converter.py  # C++ inline asm converter
 ├── utils/
+│   ├── syntax.py         # Compiler & syntax checker
+│   ├── cli.py            # CLI interface
+│   └── formatter.py      # Output formatting
+├── libs/
+│   └── stdio.py          # Standard library
+├── examples/             # Example programs
+│   ├── simple_c_test.c       # C inline asm example
+│   ├── simple_advanced_test.cpp  # C++ inline asm example
+│   └── file_scanner_direct.c # Direct asm mode example
+└── main.py              # Entry point
+```
 │   ├── syntax.py         # Compiler & syntax checker
 │   ├── cli.py            # CLI interface
 │   └── formatter.py      # Output formatting
@@ -187,12 +290,13 @@ The compiler automatically injects only the functions you use:
 
 ### Platform Matrix
 
-| Platform | Arch    | Compile | Link | Execute |
-|----------|---------|---------|------|---------|
-| Windows  | x86-64  | Yes     | Yes  | Yes     |
-| macOS    | x86-64  | Yes     | Yes  | Yes     |
-| Linux    | x86-64  | Yes     | Partial | -    |
-| macOS    | ARM64   | Partial | Partial | Partial |
+| Platform | Arch    | Assembly | C/C++ Inline | Execute |
+|----------|---------|----------|--------------|---------|
+| Windows  | x86-64  | Yes      | Yes          | Yes     |
+| macOS    | x86-64  | Yes      | Yes          | Yes     |
+| macOS    | ARM64   | Yes      | Yes          | Yes     |
+| Linux    | x86-64  | Yes      | Yes          | Yes     |
+| Linux    | ARM64   | Yes      | Yes          | Yes     |
 
 ### Cross-Compilation Examples
 
@@ -201,10 +305,13 @@ The compiler automatically injects only the functions you use:
 brew install mingw-w64 nasm
 python3 main.py code.asm --build --target windows
 
-# Native macOS
+# Native macOS (auto-detects architecture)
 python3 main.py code.asm --build --target macos
 
-# ARM64 (in progress)
+# Force x86_64 on ARM64 Mac (Rosetta 2)
+python3 main.py code.cpp --build --target macos --arch x86_64
+
+# ARM64 native
 python3 main.py code.asm --build --target macos --arch arm64
 ```
 
@@ -258,13 +365,13 @@ wine build/program.exe
 
 ## Future Roadmap
 
-- Complete ARM64 standard library
 - Implement `break` and `continue` statements
-- Add array and pointer support
+- Add array and pointer support for pure assembly
 - Implement proper return value handling
 - Add file I/O operations
 - Memory allocation functions
 - Optimization passes
+- More inline assembly features (SIMD, etc.)
 
 ## Contributing
 

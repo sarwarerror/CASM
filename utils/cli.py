@@ -76,7 +76,12 @@ class CLI:
     
     @staticmethod
     def print_usage():
-        print(f"{Colors.BOLD}Usage:{Colors.ENDC} {Colors.GREEN}casm{Colors.ENDC} {Colors.YELLOW}<input.asm>{Colors.ENDC} [options]")
+        print(f"{Colors.BOLD}Usage:{Colors.ENDC} {Colors.GREEN}casm{Colors.ENDC} {Colors.YELLOW}<input.asm|.cpp>{Colors.ENDC} [options]")
+        print()
+        print(f"{Colors.BOLD}Supported file types:{Colors.ENDC}")
+        print(f"  {Colors.CYAN}.asm{Colors.ENDC}  Assembly source with high-level syntax")
+        print(f"  {Colors.CYAN}.cpp{Colors.ENDC}  C++ with inline assembly (NASM/ARM64 syntax)")
+        print(f"  {Colors.CYAN}.c{Colors.ENDC}    C with inline assembly")
         print()
         print(f"{Colors.BOLD}Options:{Colors.ENDC}")
         print(f"  {Colors.GREEN}-o <file>{Colors.ENDC}      Specify output file")
@@ -95,6 +100,8 @@ class CLI:
         print(f"  {Colors.CYAN}casm program.asm --build{Colors.ENDC}")
         print(f"  {Colors.CYAN}casm program.asm --exe --run{Colors.ENDC}")
         print(f"  {Colors.CYAN}casm program.asm --build --target macos --arch arm64{Colors.ENDC}")
+        print(f"  {Colors.CYAN}casm program.cpp --build --target macos --arch x86_64 --run{Colors.ENDC}")
+        print(f"  {Colors.CYAN}casm program.cpp --build --target macos --arch arm64 --run{Colors.ENDC}")
         print(f"  {Colors.CYAN}casm program.asm -o output.asm -v{Colors.ENDC}")
     
     @staticmethod
@@ -126,6 +133,23 @@ class CLI:
         if len(args) < 2:
             return None
         
+        # Auto-detect host platform for default target
+        import platform
+        host_system = platform.system().lower()
+        if host_system == 'darwin':
+            default_target = 'macos'
+        elif host_system == 'linux':
+            default_target = 'linux'
+        else:
+            default_target = 'windows'
+        
+        # Auto-detect host architecture for default
+        host_machine = platform.machine().lower()
+        if host_machine in ('arm64', 'aarch64'):
+            default_arch = 'arm64'
+        else:
+            default_arch = 'x86_64'
+        
         config = {
             'input_file': None,
             'output_file': None,
@@ -134,8 +158,8 @@ class CLI:
             'run': False,
             'verbose': False,
             'debug': False,
-            'target': 'windows',
-            'arch': 'x86_64',
+            'target': default_target,
+            'arch': default_arch,
             'ldflags': '',
             'help': False
         }
