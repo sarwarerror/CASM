@@ -188,13 +188,32 @@ class CAsmConverter:
                     asm_lines.append(asm_line)
                     i += 1
                 
+                # Collect any printr(register) calls that follow this asm block
+                printf_registers = []
+                while i < len(self.lines):
+                    next_line = self.lines[i]
+                    next_stripped = next_line.strip()
+                    # Check for printr(register) pattern
+                    printf_match = re.match(r'^printr\s*\(\s*([a-zA-Z][a-zA-Z0-9]*)\s*\)\s*;?\s*$', next_stripped)
+                    if printf_match:
+                        reg = printf_match.group(1).lower()
+                        if reg in self.x86_registers or reg in self.arm64_registers:
+                            printf_registers.append((reg, self.get_indent(next_line)))
+                            i += 1
+                            continue
+                    # Skip empty lines between asm block and printf
+                    if not next_stripped:
+                        i += 1
+                        continue
+                    break
+                
                 block_arch = self.get_block_arch(asm_lines)
                 self.detected_archs.add(block_arch)
                 
                 if block_arch == 'arm64':
-                    converted = self.convert_arm64_asm_block(asm_lines, indent)
+                    converted = self.convert_arm64_asm_block(asm_lines, indent, printf_registers)
                 else:
-                    converted = self.convert_asm_block(asm_lines, indent)
+                    converted = self.convert_asm_block(asm_lines, indent, printf_registers)
                 self.output_lines.append(converted)
             # Check for direct assembly lines
             elif self.is_assembly_line(stripped):
@@ -219,17 +238,36 @@ class CAsmConverter:
                     else:
                         break
                 
+                # Collect any printr(register) calls that follow this asm block
+                printf_registers = []
+                while i < len(self.lines):
+                    next_line = self.lines[i]
+                    next_stripped = next_line.strip()
+                    # Check for printr(register) pattern
+                    printf_match = re.match(r'^printr\s*\(\s*([a-zA-Z][a-zA-Z0-9]*)\s*\)\s*;?\s*$', next_stripped)
+                    if printf_match:
+                        reg = printf_match.group(1).lower()
+                        if reg in self.x86_registers or reg in self.arm64_registers:
+                            printf_registers.append((reg, self.get_indent(next_line)))
+                            i += 1
+                            continue
+                    # Skip empty lines
+                    if not next_stripped:
+                        i += 1
+                        continue
+                    break
+                
                 block_arch = self.get_block_arch(asm_lines)
                 self.detected_archs.add(block_arch)
                 
                 if block_arch == 'arm64':
-                    converted = self.convert_arm64_asm_block(asm_lines, indent)
+                    converted = self.convert_arm64_asm_block(asm_lines, indent, printf_registers)
                 else:
-                    converted = self.convert_asm_block(asm_lines, indent)
+                    converted = self.convert_asm_block(asm_lines, indent, printf_registers)
                 self.output_lines.append(converted)
             else:
-                # Check for printf(register) pattern and convert it
-                converted_line = self.convert_printf_register(line)
+                # Check for standalone printr(register) pattern (not following asm block)
+                converted_line = self.convert_printr_register(line)
                 self.output_lines.append(converted_line)
                 i += 1
         
@@ -302,21 +340,21 @@ class CAsmConverter:
         match = re.match(r'^(\s*)', line)
         return match.group(1) if match else ''
 
-    def convert_printf_register(self, line):
+    def convert_printr_register(self, line):
         """
-        Convert printf(register) to proper printf with format string.
+        Convert printr(register) to proper printf with format string.
         
         Supports:
-        - printf(rax)  -> prints 64-bit integer
-        - printf(eax)  -> prints 32-bit integer  
-        - printf(al)   -> prints 8-bit as char
-        - printf(x0)   -> prints ARM64 register
+        - printr(rax)  -> prints 64-bit integer
+        - printr(eax)  -> prints 32-bit integer  
+        - printr(al)   -> prints 8-bit as char
+        - printr(x0)   -> prints ARM64 register
         """
         stripped = line.strip()
         indent = self.get_indent(line)
         
-        # Match printf(register) pattern - with or without semicolon
-        match = re.match(r'^printf\s*\(\s*([a-zA-Z][a-zA-Z0-9]*)\s*\)\s*;?\s*$', stripped)
+        # Match printr(register) pattern - with or without semicolon
+        match = re.match(r'^printr\s*\(\s*([a-zA-Z][a-zA-Z0-9]*)\s*\)\s*;?\s*$', stripped)
         if not match:
             return line
         
@@ -384,8 +422,11 @@ class CAsmConverter:
         # Not a register, return line unchanged
         return line
 
-    def convert_asm_block(self, lines, indent):
+    def convert_asm_block(self, lines, indent, printf_registers=None):
         """Convert a block of NASM-style assembly to GCC inline assembly."""
+        if printf_registers is None:
+            printf_registers = []
+        
         block_id = CAsmConverter._asm_block_counter
         CAsmConverter._asm_block_counter += 1
         
@@ -476,6 +517,24 @@ class CAsmConverter:
             # Track variables and clobbers
             self.analyze_operands(mnemonic, operands, variables, clobbers)
             
+            # Special handling for LEA with simple variable
+            # lea rbx, [buffer] -> need to load address into register
+            if mnemonic == 'lea' and len(operands) == 2:
+                dest_reg = operands[0].lower()
+                src = operands[1]
+                # Check for [variable] pattern (simple variable reference)
+                var_match = re.match(r'^\[([a-zA-Z_][a-zA-Z0-9_]*)\]$', src)
+                if var_match:
+                    var_name = var_match.group(1)
+                    if var_name.lower() not in self.x86_registers:
+                        # This is lea reg, [variable] - convert to mov reg, address
+                        # In GCC inline asm, we use leaq with RIP-relative or direct address
+                        clobbers.add(self.normalize_register(dest_reg))
+                        # Use leaq with the variable name directly (GCC will handle it)
+                        asm_instr = f'"leaq {var_name}(%%rip), %%{dest_reg}\\n\\t"'
+                        converted_lines.append(asm_instr)
+                        continue
+            
             # Convert operands to AT&T format
             att_operands = []
             for op in operands:
@@ -500,7 +559,11 @@ class CAsmConverter:
                 att_operands = [att_operands[2], att_operands[1], att_operands[0]]
             
             # Build the instruction string
-            att_mnemonic = mnemonic + suffix
+            # Handle movsxd -> movslq conversion (AT&T name)
+            if mnemonic == 'movsxd':
+                att_mnemonic = 'movslq'
+            else:
+                att_mnemonic = mnemonic + suffix
             if att_operands:
                 asm_instr = f'"{att_mnemonic} {", ".join(att_operands)}\\n\\t"'
             else:
@@ -517,8 +580,32 @@ class CAsmConverter:
         if has_memory_write:
             clobbers.add('memory')
         
-        # Build constraint lists
-        outputs, inputs, var_to_index = self.build_constraints(variables)
+        # Handle printf(register) - prepare output constraints for register extraction
+        # We add these outputs FIRST, then build_constraints will account for them
+        printf_var_names = []
+        printf_outputs = []
+        if printf_registers:
+            for reg_name, _ in printf_registers:
+                var_name = f'__casm_reg_{reg_name}__'
+                printf_var_names.append((reg_name, var_name))
+                printf_outputs.append(f'"=r" ({var_name})')
+                # Don't clobber this register since we're reading it
+                norm_reg = self.normalize_register(reg_name)
+                clobbers.discard(norm_reg)
+        
+        # Build constraint lists - with offset to account for printf outputs
+        outputs, inputs, var_to_index = self.build_constraints(variables, len(printf_outputs))
+        
+        # Add printf output mov instructions using indices after regular outputs
+        printf_output_start_idx = len(printf_outputs) + len(outputs)
+        for i, (reg_name, var_name) in enumerate(printf_var_names):
+            norm_reg = self.normalize_register(reg_name)
+            # Printf outputs are at indices 0..len(printf_outputs)-1
+            output_idx = i
+            converted_lines.append(f'"movq %%{norm_reg}, %{output_idx}\\n\\t"')
+        
+        # Prepend printf outputs to the outputs list
+        final_outputs = printf_outputs + outputs
         
         # Replace variable placeholders
         final_lines = []
@@ -528,11 +615,17 @@ class CAsmConverter:
             final_lines.append(line)
         
         # Build final __asm__ block
-        result = f'{indent}__asm__ volatile(\n'
+        # First, declare any printf register variables
+        result = ''
+        if printf_var_names:
+            for _, var_name in printf_var_names:
+                result += f'{indent}unsigned long long {var_name};\n'
+        
+        result += f'{indent}__asm__ volatile(\n'
         result += f'{indent}    ' + f'\n{indent}    '.join(final_lines)
         
-        if outputs or inputs:
-            result += f'\n{indent}    : ' + ', '.join(outputs)
+        if final_outputs or inputs:
+            result += f'\n{indent}    : ' + ', '.join(final_outputs)
             result += f'\n{indent}    : ' + ', '.join(inputs)
         else:
             result += f'\n{indent}    : '
@@ -543,6 +636,11 @@ class CAsmConverter:
             result += f'\n{indent}    : ' + ', '.join(clobber_list)
         
         result += f'\n{indent});'
+        
+        # Add printf statements for each register
+        if printf_var_names:
+            for reg_name, var_name in printf_var_names:
+                result += f'\n{indent}printf("%lld", (long long){var_name});'
         
         return result
 
@@ -580,6 +678,8 @@ class CAsmConverter:
             'jz', 'jnz', 'jo', 'jno', 'js', 'jns', 'jp', 'jnp',
             'call', 'ret', 'leave', 'nop', 'hlt', 'syscall', 'int',
             'loop', 'loope', 'loopne', 'push', 'pop',
+            'movsxd', 'movsx', 'movzx',  # These have implicit sizing
+            'lea', 'leaq',  # LEA uses destination register size
         }
         
         if mnemonic in no_suffix_ops:
@@ -845,12 +945,17 @@ class CAsmConverter:
         
         return result if result else '0'
 
-    def build_constraints(self, variables):
-        """Build output and input constraint lists."""
+    def build_constraints(self, variables, index_offset=0):
+        """Build output and input constraint lists.
+        
+        Args:
+            variables: Dict of variable info
+            index_offset: Starting index offset for constraint numbering
+        """
         outputs = []
         inputs = []
         var_to_index = {}
-        current_idx = 0
+        current_idx = index_offset
         
         sorted_vars = sorted(variables.items(), key=lambda x: x[1]['index'])
         
@@ -867,7 +972,12 @@ class CAsmConverter:
         # Second pass: inputs
         for var_name, info in sorted_vars:
             if not info['write'] and info['read']:
-                inputs.append(f'"r" ({var_name})')
+                # For array bases used with LEA, we need "m" constraint for memory
+                # But for general usage, we use "r" for registers
+                if info.get('is_array_base'):
+                    inputs.append(f'"r" ({var_name})')
+                else:
+                    inputs.append(f'"r" ({var_name})')
                 var_to_index[var_name] = current_idx
                 current_idx += 1
         
@@ -877,8 +987,11 @@ class CAsmConverter:
     # ARM64 Support
     # =========================================================================
     
-    def convert_arm64_asm_block(self, lines, indent):
+    def convert_arm64_asm_block(self, lines, indent, printf_registers=None):
         """Convert ARM64 assembly to GCC inline assembly."""
+        if printf_registers is None:
+            printf_registers = []
+        
         variables = {}
         clobbers = set()
         converted_lines = []
@@ -958,8 +1071,35 @@ class CAsmConverter:
         if has_memory_write:
             clobbers.add('memory')
         
-        # Build constraint lists
-        outputs, inputs, var_to_index = self.build_constraints(variables)
+        # Handle printf(register) - prepare output constraints for register extraction
+        printf_var_names = []
+        printf_outputs = []
+        if printf_registers:
+            for reg_name, _ in printf_registers:
+                var_name = f'__casm_reg_{reg_name}__'
+                printf_var_names.append((reg_name, var_name))
+                printf_outputs.append(f'"=r" ({var_name})')
+                # Normalize register to 64-bit (x0 instead of w0)
+                norm_reg = reg_name
+                if reg_name.startswith('w'):
+                    norm_reg = 'x' + reg_name[1:]
+                clobbers.discard(reg_name)
+                clobbers.discard(norm_reg)
+        
+        # Build constraint lists with offset to account for printf outputs
+        outputs, inputs, var_to_index = self.build_constraints(variables, len(printf_outputs))
+        
+        # Add the printf register extraction instructions
+        # Printf outputs are at indices 0..len(printf_outputs)-1
+        for i, (reg_name, var_name) in enumerate(printf_var_names):
+            norm_reg = reg_name
+            if reg_name.startswith('w'):
+                norm_reg = 'x' + reg_name[1:]
+            output_idx = i
+            converted_lines.append(f'"mov %{output_idx}, {norm_reg}\\n\\t"')
+        
+        # Prepend printf outputs to the outputs list
+        final_outputs = printf_outputs + outputs
         
         # Replace variable placeholders
         final_lines = []
@@ -969,11 +1109,17 @@ class CAsmConverter:
             final_lines.append(line)
         
         # Build final __asm__ block
-        result = f'{indent}__asm__ volatile(\n'
+        # First, declare any printf register variables
+        result = ''
+        if printf_var_names:
+            for _, var_name in printf_var_names:
+                result += f'{indent}unsigned long long {var_name};\n'
+        
+        result += f'{indent}__asm__ volatile(\n'
         result += f'{indent}    ' + f'\n{indent}    '.join(final_lines)
         
-        if outputs or inputs:
-            result += f'\n{indent}    : ' + ', '.join(outputs)
+        if final_outputs or inputs:
+            result += f'\n{indent}    : ' + ', '.join(final_outputs)
             result += f'\n{indent}    : ' + ', '.join(inputs)
         else:
             result += f'\n{indent}    : '
@@ -984,6 +1130,11 @@ class CAsmConverter:
             result += f'\n{indent}    : ' + ', '.join(clobber_list)
         
         result += f'\n{indent});'
+        
+        # Add printf statements for each register
+        if printf_var_names:
+            for reg_name, var_name in printf_var_names:
+                result += f'\n{indent}printf("%lld", (long long){var_name});'
         
         return result
 
