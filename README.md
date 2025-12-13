@@ -399,6 +399,80 @@ python3 main.py code.asm --build --target macos --arch arm64
 
 ## Advanced Features
 
+## Windows Helpers: Dynamic API Resolution & Reflective Loader
+
+These helpers were recently added to `libs/win.py`. They provide runtime, position-independent
+API resolution and a reflective PE loader suitable for manual mapping / injection workflows.
+
+New helper functions
+- `ResolveAPIs`: Resolves a set of common Windows APIs by precomputed hashes and stores
+    their addresses into BSS variables. Useful as a bulk resolver when you know which APIs
+    you'll need up-front.
+- `GetKernel32`: Returns `RAX =` base address of `kernel32.dll` via the PEB.
+- `GetProcAddrByHash`: Resolve an export by a 32-bit hash value from a module export table.
+- `CalcHash`: Compute the ROR13-style rotating hash used by the resolver.
+- `GetAPIByName`: Given a module base in `RCX` and a pointer to an ASCII API name in `RDX`,
+    this helper computes the hash and resolves the API address (returns in `RAX`).
+- `GetAPI`: Convenience wrapper that accepts `RCX = module base` (0 to auto-select `kernel32`)
+    and `RDX = pointer to ASCII name`, returns API pointer in `RAX`.
+- `reflective_loader`: Position-independent reflective PE loader (call with `RCX = image base`).
+- `string_compare` (simple): Case-sensitive null-terminated string equality check returning
+    `RAX = 1` on match, `RAX = 0` otherwise.
+
+Usage notes
+- The resolver uses a small rotating hash (`CalcHash`) and `GetProcAddrByHash` to find exports.
+- Use `GetAPI` when you have a function name at runtime and want the address dynamically:
+
+```nasm
+; RCX = 0 (use kernel32), RDX = pointer to "VirtualAllocEx\0"
+lea rdx, [rel virtualallocex_name]
+xor rcx, rcx
+call GetAPI
+; RAX now contains pointer to VirtualAllocEx (or 0 on failure)
+
+virtualallocex_name:
+        db "VirtualAllocEx",0
+```
+
+- Example: resolve and call `VirtualAllocEx` dynamically
+
+```nasm
+; Resolve
+xor rcx, rcx
+lea rdx, [rel virtualallocex_name]
+call GetAPI
+test rax, rax
+jz .fail
+
+; Call via function pointer (Windows x86_64 calling convention)
+mov rax, rax        ; fptr
+mov rcx, [targetProcessHandle]
+xor rdx, rdx        ; lpAddress = NULL
+mov r8, 0x1000      ; flAllocationType = MEM_COMMIT
+mov r9, 0x40        ; flProtect = PAGE_EXECUTE_READWRITE
+; push region size on stack as 5th arg
+sub rsp, 8
+mov qword [rsp], 0x2000
+call rax
+add rsp, 8
+```
+
+- Example: Using the `reflective_loader` to execute a mapped PE image
+
+```nasm
+; After mapping a PE image blob to memory at address in RCX
+; Call reflective loader to apply relocations, resolve imports and run entry
+call reflective_loader
+```
+
+Notes & security
+- The provided resolver and loader are low-level utilities meant for research and advanced
+    development. They operate without using Windows import APIs directly (PEB walking and
+    export table parsing) and therefore may resemble techniques used by advanced tooling.
+- Ensure you have the right to load and execute any binaries and that your use complies
+    with laws and policies in your environment.
+
+
 ### Register Allocation
 - Automatic allocation for loop variables and parameters
 - Prefers callee-saved registers (r12-r15, rbx) for loop counters

@@ -1,6 +1,7 @@
 from src.lexer import Lexer
 from src.codegen import CodeGenerator
 from libs.stdio import StandardLibrary
+from libs.win import WindowsHelpers
 from src.token import TokenType
 from .formatter import format_and_merge
 from .cli import CLI
@@ -125,6 +126,8 @@ class Compiler:
         self.target = kwargs.get('target', 'windows')
         self.arch = kwargs.get('arch', 'x86_64')
         self.stdlib = StandardLibrary(target=self.target, arch=self.arch)
+        # Initialize Windows helpers for Windows-specific syscall functions
+        self.winlib = WindowsHelpers(arch=self.arch) if self.target == 'windows' else None
 
     def log(self, message):
         if self.verbose:
@@ -438,14 +441,28 @@ class Compiler:
         # `extern <name>` in the source.
         # Merge explicitly requested externs with implicitly used stdlib functions
         # from the code generation phase.
+        # Keep both original case (for win.py) and lowercase (for stdio.py)
         combined_used = set()
+        combined_used_original = set()
         if user_externs:
             combined_used.update(n.lower() for n in user_externs if isinstance(n, str))
+            combined_used_original.update(user_externs)
         if stdlib_used:
             combined_used.update(n.lower() for n in stdlib_used)
+            combined_used_original.update(stdlib_used)
 
         # Use formatter to produce final merged content
         deps = self.stdlib.get_dependencies(combined_used)
+        
+        # Merge Windows-specific helpers if targeting Windows
+        # Use original case for win.py since it uses CamelCase function names
+        if self.winlib:
+            win_deps = self.winlib.get_dependencies(combined_used_original)
+            if win_deps['code']:
+                deps['code'] = deps['code'] + '\n\n' + win_deps['code'] if deps['code'] else win_deps['code']
+            deps['data'].extend(win_deps.get('data', []))
+            deps['bss'].extend(win_deps.get('bss', []))
+            deps['externs'].update(win_deps.get('externs', set()))
 
         final = format_and_merge(processed_original, other_gen_lines, gen_blocks, deps, data_section, arch=self.arch)
         return final

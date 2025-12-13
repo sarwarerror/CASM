@@ -1,4 +1,4 @@
-build/
+
 
 # Python bytecode
 __pycache__/
@@ -7,7 +7,7 @@ __pycache__/
 
 # Distribution / packaging
 .Python
-build/
+
 develop-eggs/
 dist/
 downloads/
@@ -28,7 +28,7 @@ MANIFEST
 *.manifest
 *.spec
 
-examples
+
 
 # Installer logs
 pip-log.txt

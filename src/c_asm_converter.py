@@ -632,8 +632,12 @@ class CAsmConverter:
             result += f'\n{indent}    : '
         
         if clobbers:
-            clobber_list = [f'"{c}"' for c in sorted(clobbers)]
-            result += f'\n{indent}    : ' + ', '.join(clobber_list)
+            # Filter out stack pointers from clobbers to avoid GCC warnings/errors
+            # "listing the stack pointer register 'rsp' in a clobber list is deprecated"
+            filtered_clobbers = {c for c in clobbers if c not in {'rsp', 'esp', 'sp'}}
+            if filtered_clobbers:
+                clobber_list = [f'"{c}"' for c in sorted(filtered_clobbers)]
+                result += f'\n{indent}    : ' + ', '.join(clobber_list)
         
         result += f'\n{indent});'
         
@@ -688,13 +692,13 @@ class CAsmConverter:
         # Check for explicit size
         for op in operands:
             op_lower = op.lower()
-            if 'byte' in op_lower:
+            if re.search(r'\bbyte\b', op_lower):
                 return 'b'
-            elif 'word' in op_lower and 'dword' not in op_lower and 'qword' not in op_lower:
+            elif re.search(r'\bword\b', op_lower) and not re.search(r'\bdword\b', op_lower) and not re.search(r'\bqword\b', op_lower):
                 return 'w'
-            elif 'dword' in op_lower:
+            elif re.search(r'\bdword\b', op_lower):
                 return 'l'
-            elif 'qword' in op_lower:
+            elif re.search(r'\bqword\b', op_lower):
                 return 'q'
         
         # Check operands for register sizes
@@ -711,7 +715,7 @@ class CAsmConverter:
         if operands:
             dest = operands[0]
             is_write = mnemonic in self.write_ops
-            is_read = mnemonic in self.rmw_ops
+            is_read = mnemonic in self.rmw_ops or mnemonic in self.read_ops
             self.track_operand(dest, is_read, is_write, variables, clobbers)
         
         if len(operands) > 1:
@@ -829,19 +833,22 @@ class CAsmConverter:
         var_match = re.match(r'^\[([a-zA-Z_][a-zA-Z0-9_]*)\]$', op)
         if var_match:
             var_name = var_match.group(1)
+            prefix = '*' if mnemonic in {'call', 'jmp'} else ''
             if var_name.lower() not in self.x86_registers:
-                return f'__VAR_{var_name}__'
+                return f'{prefix}__VAR_{var_name}__'
             else:
-                return f'(%%{var_name.lower()})'
+                return f'{prefix}(%%{var_name.lower()})'
         
         # Handle complex memory operands
         if '[' in op and ']' in op:
-            return self.convert_memory_operand(op)
+            prefix = '*' if mnemonic in {'call', 'jmp'} else ''
+            return prefix + self.convert_memory_operand(op)
         
         # Handle registers
         reg = op.lower()
         if reg in self.x86_registers:
-            return f'%%{reg}'
+            prefix = '*' if mnemonic in {'call', 'jmp'} else ''
+            return f'{prefix}%%{reg}'
         
         # Handle immediates
         if op.startswith('0x') or op.startswith('0X'):
@@ -849,14 +856,15 @@ class CAsmConverter:
         if op.isdigit() or (op.startswith('-') and op[1:].isdigit()):
             return f'${op}'
         
+        # Handle bare identifier (C variable without brackets)
+        if re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', op):
+            prefix = '*' if mnemonic in {'call', 'jmp'} else ''
+            return f'{prefix}__VAR_{op}__'
+        
         # Handle labels (for jumps/calls)
         if mnemonic in {'jmp', 'je', 'jne', 'jz', 'jnz', 'jg', 'jge', 'jl', 'jle',
                        'ja', 'jae', 'jb', 'jbe', 'call', 'loop'}:
             return op
-        
-        # Handle bare identifier (C variable without brackets)
-        if re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', op):
-            return f'__VAR_{op}__'
         
         return op
 
@@ -977,7 +985,7 @@ class CAsmConverter:
                 if info.get('is_array_base'):
                     inputs.append(f'"r" ({var_name})')
                 else:
-                    inputs.append(f'"r" ({var_name})')
+                    inputs.append(f'"rm" ({var_name})')
                 var_to_index[var_name] = current_idx
                 current_idx += 1
         

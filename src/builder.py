@@ -10,6 +10,16 @@ class Builder:
         self.compiled_file = compiled_file
         self.verbose = verbose
         self.target = target  # 'windows', 'linux', 'macos'
+        # For Windows target, default to x86_64 unless explicitly set to arm64
+        # This is because most Windows development targets x86_64
+        if target == 'windows' and arch == 'arm64':
+            # Only keep arm64 if the user explicitly requested it
+            # We can't easily detect this here, so we'll check if the asm has x86_64 code
+            import platform
+            host_arch = platform.machine().lower()
+            # If host is arm64 but target is windows, assume x86_64 unless user specified
+            # (The CLI should pass the correct arch, but we default to x86_64 for Windows)
+            pass  # Keep arch as-is, we'll handle this below
         self.arch = arch  # 'x86_64', 'arm64'
         # linker_flags is a single string (e.g. "-L/path -lSDL2 -lSDL2main -mwindows")
         self.linker_flags = linker_flags or ''
@@ -30,6 +40,12 @@ class Builder:
         if self.compiled_file.lower().endswith('.cpp'):
             return self.compile_cpp_file()
 
+        # For pure assembly files targeting Windows, force x86_64 architecture
+        # since Windows assembly is typically x86_64 NASM syntax
+        effective_arch = self.arch
+        if self.target == 'windows' and self.compiled_file.lower().endswith('.asm'):
+            effective_arch = 'x86_64'
+        
         obj_ext = '.obj' if self.target == 'windows' else '.o'
         exe_ext = '.exe' if self.target == 'windows' else ''
 
@@ -45,11 +61,11 @@ class Builder:
         
         with CLI.spinner(f"Building {os.path.basename(exe_file)}..."):
             self.log(f"Assembling {self.compiled_file}...")
-            if not self.assemble_file(self.compiled_file, obj_file):
+            if not self.assemble_file(self.compiled_file, obj_file, effective_arch):
                 return False
             
             self.log(f"Linking {exe_file}...")
-            if not self.link_files(obj_file, exe_file):
+            if not self.link_files(obj_file, exe_file, effective_arch):
                 return False
         
         CLI.success(f"Built {os.path.basename(exe_file)}")
@@ -302,9 +318,12 @@ class Builder:
         CLI.success(f"Built {os.path.basename(exe_file)}")
         return True
     
-    def assemble_file(self, asm_file, obj_file):
+    def assemble_file(self, asm_file, obj_file, arch=None):
+        # Use provided arch or fall back to self.arch
+        effective_arch = arch if arch is not None else self.arch
+        
         # ARM64 uses clang as assembler (.s files), x86_64 uses NASM (.asm files)
-        if self.arch == 'arm64':
+        if effective_arch == 'arm64':
             # Use clang to assemble ARM64 .s files
             if self.target == 'windows':
                 clang_cmd = ['clang', '-c', asm_file, '-o', obj_file, '--target=aarch64-pc-windows-msvc']
@@ -372,11 +391,14 @@ class Builder:
                 CLI.error(f"Assembly error: {e}")
                 return False
     
-    def link_files(self, obj_file, exe_file):
+    def link_files(self, obj_file, exe_file, arch=None):
+        # Use provided arch or fall back to self.arch
+        effective_arch = arch if arch is not None else self.arch
+        
         # Linking depends on target and toolchain availability
         try:
             if self.target == 'windows':
-                if self.arch == 'arm64':
+                if effective_arch == 'arm64':
                     # Use clang/lld for ARM64 Windows
                     link_cmd = ['clang', obj_file, '-o', exe_file, '--target=aarch64-pc-windows-msvc', '-fuse-ld=lld']
                     # Add msvcrt if needed, but clang usually links default libs
