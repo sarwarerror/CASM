@@ -232,32 +232,25 @@ section .text
 ```
 .
 ├── src/
-│   ├── lexer.py          # Tokenization
-│   ├── token.py          # Token definitions
-│   ├── codegen.py        # Code generation
-│   ├── backend.py        # Backend abstraction
-│   ├── builder.py        # Assembly & linking
+│   ├── lexer.py              # Tokenization
+│   ├── token.py              # Token definitions
+│   ├── codegen.py            # Code generation
+│   ├── backend.py            # Backend abstraction
+│   ├── builder.py            # Assembly & linking
 │   ├── c_asm_converter.py    # C inline asm converter
 │   └── cpp_asm_converter.py  # C++ inline asm converter
 ├── utils/
-│   ├── syntax.py         # Compiler & syntax checker
-│   ├── cli.py            # CLI interface
-│   └── formatter.py      # Output formatting
+│   ├── syntax.py             # Compiler & syntax checker
+│   ├── cli.py                # CLI interface
+│   └── formatter.py          # Output formatting
 ├── libs/
-│   └── stdio.py          # Standard library
-├── examples/             # Example programs
+│   ├── stdio.py              # Standard I/O library
+│   └── win.py                # Windows low-level helpers (syscalls, PEB, PE parsing)
+├── examples/                 # Example programs
 │   ├── simple_c_test.c       # C inline asm example
 │   ├── simple_advanced_test.cpp  # C++ inline asm example
 │   └── file_scanner_direct.c # Direct asm mode example
-└── main.py              # Entry point
-```
-│   ├── syntax.py         # Compiler & syntax checker
-│   ├── cli.py            # CLI interface
-│   └── formatter.py      # Output formatting
-├── libs/
-│   └── stdio.py          # Standard library
-├── examples/             # Example programs
-└── main.py              # Entry point
+└── main.py                   # Entry point
 ```
 
 ## Standard Library
@@ -285,6 +278,95 @@ The compiler automatically injects only the functions you use:
 ### Memory Functions
 - `memset` - Set memory region
 - `memcpy` - Copy memory region
+
+## Windows Low-Level Library (`libs/win.py`)
+
+Advanced Windows-specific functions for low-level syscall operations, EDR evasion, and direct NT API access. All functions are position-independent and avoid hooked APIs.
+
+### String Utilities
+| Function | Input | Output | Description |
+|----------|-------|--------|-------------|
+| `strlen` | `RCX` = string pointer | `RAX` = length | Get null-terminated string length |
+| `strcmp` | `RCX` = str1, `RDX` = str2 | `RAX` = 0 (equal), 1/-1 (diff) | Case-sensitive string compare |
+| `stricmp` | `RCX` = str1, `RDX` = str2 | `RAX` = 0 (equal), 1 (diff) | Case-insensitive string compare |
+| `memcpy` | `RCX` = dest, `RDX` = src, `R8` = size | `RAX` = dest | Copy memory (8-byte optimized) |
+| `memset` | `RCX` = dest, `DL` = value, `R8` = size | `RAX` = dest | Fill memory with value |
+
+### Hash Utilities (API Hashing)
+| Function | Input | Output | Description |
+|----------|-------|--------|-------------|
+| `djb2_hash` | `RCX` = string pointer | `RAX` = 32-bit hash | DJB2 hash algorithm |
+| `ror13_hash` | `RCX` = string pointer | `EAX` = 32-bit hash | ROR13 hash (Metasploit-style) |
+
+### PEB Walking (Module Enumeration)
+| Function | Input | Output | Description |
+|----------|-------|--------|-------------|
+| `GetNtdllBase` | None | `RAX` = base address | Get ntdll.dll base via PEB |
+| `GetKernel32Base` | None | `RAX` = base address | Get kernel32.dll base via PEB |
+| `GetModuleByHash` | `ECX` = ROR13 hash | `RAX` = base address | Find module by hashed name |
+
+### PE Parsing
+| Function | Input | Output | Description |
+|----------|-------|--------|-------------|
+| `GetExportDirectory` | `RCX` = module base | `RAX` = export dir ptr | Parse PE export directory |
+| `GetProcAddressByName` | `RCX` = base, `RDX` = name | `RAX` = function addr | Resolve function by name |
+| `GetProcAddressByHash` | `RCX` = base, `EDX` = hash | `RAX` = function addr | Resolve function by ROR13 hash |
+
+### Syscall Helpers (Hell's Gate + Halo's Gate)
+| Function | Input | Output | Description |
+|----------|-------|--------|-------------|
+| `ExtractSSN` | `RCX` = function address | `EAX` = SSN (-1 if hooked) | Extract SSN with hook detection |
+| `ResolveFunction` | `RCX` = name, `RDX` = output buffer (16 bytes) | `RAX` = 1 (success), 0 (fail) | Full resolver with Hell's Gate + Halo's Gate |
+
+**ResolveFunction Output Buffer Format:**
+```
+[+0]  DWORD: SSN (System Service Number)
+[+4]  DWORD: Flags (0 = direct, 1 = recovered via Halo's Gate)
+[+8]  QWORD: Syscall gadget address
+```
+
+### Indirect Syscall Execution
+| Function | Input | Output | Description |
+|----------|-------|--------|-------------|
+| `IndirectSyscall` | `RCX` = SSN, `RDX` = gadget, `R8-R9` = args, stack = more args | `RAX` = NTSTATUS | Execute syscall via gadget |
+| `PrepareAndExecuteSyscall` | `RCX` = func name, `RDX-R9` = args | `RAX` = NTSTATUS | Resolve and execute in one call |
+| `InitSyscallTable` | `RCX` = buffer, `RDX` = names array, `R8` = count | `RAX` = success count | Pre-resolve multiple syscalls |
+| `SyscallFromTable` | `RCX` = table entry, `RDX-R9` = args | `RAX` = NTSTATUS | Execute from pre-resolved table |
+
+### Direct Syscall Wrappers
+| Function | Arguments | Description |
+|----------|-----------|-------------|
+| `DirectNtAllocateVirtualMemory` | `RCX` = ProcessHandle, `RDX` = BaseAddress*, `R8` = ZeroBits, `R9` = RegionSize*, `[rsp+0x28]` = AllocationType, `[rsp+0x30]` = Protect | Allocate virtual memory |
+| `DirectNtProtectVirtualMemory` | `RCX` = ProcessHandle, `RDX` = BaseAddress*, `R8` = RegionSize*, `R9` = NewProtect, `[rsp+0x28]` = OldProtect* | Change memory protection |
+| `DirectNtWriteVirtualMemory` | `RCX` = ProcessHandle, `RDX` = BaseAddress, `R8` = Buffer, `R9` = Size, `[rsp+0x28]` = BytesWritten* | Write to process memory |
+| `DirectNtCreateThreadEx` | `RCX` = ThreadHandle*, `RDX` = DesiredAccess, `R8` = ObjectAttributes, `R9` = ProcessHandle, `[rsp+0x28]` = StartRoutine, `[rsp+0x30]` = Argument, ... | Create thread |
+
+### Usage Example
+
+```nasm
+section .bss
+    syscall_info resb 16        ; Buffer for resolved syscall info
+
+section .text
+    ; Resolve NtAllocateVirtualMemory
+    lea rcx, [rel nt_alloc_name]
+    lea rdx, [rel syscall_info]
+    call ResolveFunction
+    
+    ; Check success
+    test rax, rax
+    jz .error
+    
+    ; Execute via indirect syscall
+    mov ecx, [syscall_info]      ; SSN
+    mov rdx, [syscall_info + 8]  ; Gadget address
+    mov r8, -1                   ; ProcessHandle (current)
+    ; ... set up remaining args
+    call IndirectSyscall
+
+nt_alloc_name:
+    db "NtAllocateVirtualMemory", 0
+```
 
 ## Cross-Platform Support
 
